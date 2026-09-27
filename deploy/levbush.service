@@ -1,0 +1,18 @@
+[Unit]
+Description=Levbush Relationships — бот статистики и карты связей
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/levbush_relationships
+ExecStart=%h/.local/share/levbush/venv/bin/python -m levbush run
+Restart=always
+RestartSec=20
+# Nemotron запускается отдельным юнитом levbush-nemotron (systemd-run), бот сам его гасит
+OOMPolicy=continue
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

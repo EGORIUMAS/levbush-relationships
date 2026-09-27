@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Интерактивная карта отношений участников группы">
+  <title>Levbush Relationships</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M8 9L24 12L14 24Z' stroke='%23f2b134' stroke-width='2.5' fill='none'/%3E%3Ccircle cx='8' cy='9' r='5' fill='%234a8ad8'/%3E%3Ccircle cx='24' cy='12' r='4' fill='%23ef5f3c'/%3E%3Ccircle cx='14' cy='24' r='5' fill='%23d42a78'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="config.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/force-graph@1.51.4/dist/force-graph.min.js" integrity="sha384-Hm6GpQcTNI5VqGgGS7lLxTGtEFcxu/kOVV0B7ozIZRu9blWVvigv5httJQZ2qZmY" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@18.0.14/lib/marked.umd.js" integrity="sha384-2vpGtuKqJvFlwJqYnf/wUMuzUfhUnYBt9oay0e2yaFcq0Dh6/aEbQ8YAOeKGzlYo" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js" integrity="sha384-a7SzOxErzJ3ZpQz0zJ32d67dSitNzPcbfybc/ykU9KJhMgZkwqfSxlhhdJRS+XGL" crossorigin="anonymous"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div id="app" hidden>
+    <div id="graph" aria-label="Карта отношений"></div>
+
+    <header class="topbar">
+      <div class="card brand">
+        <div class="brand-row">
+          <h1 id="g-title">Levbush</h1>
+          <span id="demo-badge" class="badge badge-accent" hidden>демо</span>
+        </div>
+        <div id="g-meta" class="meta"></div>
+        <div id="g-pass" class="pass" hidden></div>
+      </div>
+
+      <div class="card tools">
+        <div class="search">
+          <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+          <input id="search" type="search" placeholder="Найти участника" autocomplete="off" spellcheck="false" enterkeyhint="search" aria-label="Поиск участника" aria-controls="search-results" aria-autocomplete="list">
+          <ul id="search-results" class="search-results" role="listbox" hidden></ul>
+        </div>
+        <button id="btn-filters" class="icon-btn only-mobile" type="button" aria-label="Настройки карты" aria-expanded="false" aria-controls="controls">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+        </button>
+      </div>
+
+      <div class="card controls" id="controls">
+        <label class="range">
+          <span>Мин. сила связи</span>
+          <input id="min-strength" type="range" min="0" max="1" step="0.01" value="0">
+          <output id="min-strength-out" for="min-strength">0.00</output>
+        </label>
+        <div class="controls-row">
+          <label class="switch"><input type="checkbox" id="labels" checked><span class="switch-ui" aria-hidden="true"></span><span>Подписи</span></label>
+          <span id="links-count" class="muted small"></span>
+          <button id="logout" class="btn-text" type="button" hidden>Выйти</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="legend card" aria-label="Шкала силы связи">
+      <div class="legend-title">Сила связи</div>
+      <div class="legend-bar" id="legend-bar"></div>
+      <div class="legend-ticks"><span>0</span><span>0.5</span><span>1</span></div>
+    </div>
+
+    <div class="zoom-ctl">
+      <button class="icon-btn card" type="button" id="z-me" aria-label="Показать меня" title="Показать меня" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/><path d="M12 1v3M12 20v3M1 12h3M20 12h3"/></svg>
+      </button>
+      <button class="icon-btn card" type="button" id="z-in" aria-label="Приблизить" title="Приблизить">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button class="icon-btn card" type="button" id="z-out" aria-label="Отдалить" title="Отдалить">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg>
+      </button>
+      <button class="icon-btn card" type="button" id="z-fit" aria-label="Показать всех" title="Показать всех">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <aside id="panel" class="panel" aria-hidden="true" aria-labelledby="panel-title">
+    <div class="panel-head">
+      <button id="panel-back" class="icon-btn" type="button" aria-label="Назад" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
+      <div id="panel-title" class="panel-title"></div>
+      <button id="panel-close" class="icon-btn" type="button" aria-label="Закрыть">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div id="panel-body" class="panel-body"></div>
+  </aside>
+
+  <div id="screen" class="screen" role="status" aria-live="polite">
+    <div class="screen-card"><div class="spinner"></div><p>Загрузка…</p></div>
+  </div>
+  <noscript><div class="screen"><div class="screen-card"><p>Для работы карты нужен JavaScript.</p></div></div></noscript>
+</body>
+</html>

@@ -1,0 +1,285 @@
+"""Офлайн-проверки без Telegram, базы и GPU: синтетическая группа → статистика, окна, шаги, запрос с медиа.
+
+    ~/.local/share/levbush/venv/bin/python -m pytest -q tests/
+"""
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import subprocess
+import time
+import urllib.parse
+from datetime import datetime, timedelta
+
+import pytest
+
+from levbush import stats as S
+from levbush.analyze import Analyzer
+from levbush.cache import Cache
+from levbush.config import Config
+from levbush.episodes import segment
+from levbush.retell import Retell, md_to_tg
+from levbush.web import auth_user
+
+CHAT = -1001234567890
+CHANNEL = -1009876543210
+A, B, C, D = 101, 102, 103, 104
+NOW = int(time.time())
+
+
+def ffmpeg(*args):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", *args], check=True)
+
+
+@pytest.fixture(scope="module")
+def env(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("lb")
+    cfg = Config()
+    cfg.data_dir = tmp / "data"
+    cfg.media_dir = tmp / "media"
+    cfg.session_file = tmp / "sess" / "s"
+    cfg.ensure_dirs()
+    cache = Cache(cfg.cache_db)
+    media = tmp / "media"
+    from PIL import Image
+    Image.new("RGB", (64, 48), (200, 30, 30)).save(media / "p.jpg")
+    ffmpeg("-f", "lavfi", "-i", "sine=f=440:d=3", "-c:a", "libopus", str(media / "v.ogg"))
+    ffmpeg("-f", "lavfi", "-i", "testsrc=s=240x240:d=2", "-f", "lavfi", "-i", "sine=d=2", "-shortest",
+           "-c:v", "libx264", "-c:a", "aac", str(media / "vn.mp4"))
+    ffmpeg("-f", "lavfi", "-i", "testsrc=s=160x120:d=1", "-c:v", "libx264", str(media / "g.mp4"))
+    Image.new("RGB", (100, 140), (255, 255, 255)).save(media / "doc.pdf")
+    (media / "notes.txt").write_text("список покупок: хлеб, молоко")
+
+    cache.set("chat", {"id": CHAT, "title": "Тест", "username": None, "channel_id": CHANNEL, "channel_title": "Канал"})
+    for uid, name, uname in ((A, "Аня", "anya"), (B, "Боря", "borya"), (C, "Вика", None), (D, "Гоша", "gosha")):
+        cache.upsert_user({"id": uid, "first_name": name, "username": uname, "is_member": 0 if uid == D else 1})
+    cache.upsert_user({"id": CHANNEL, "kind": "channel", "first_name": "Канал"})
+    base = NOW - 5 * 86400
+    cache.add_membership(A, base - 30 * 86400, "join", "t")
+    cache.add_membership(D, base - 10 * 86400, "join", "t")
+    cache.add_membership(D, base - 5 * 86400, "leave", "t")          # вышел и вернулся
+    cache.add_membership(D, base - 2 * 86400, "join", "t")
+    cache.add_membership(D, base + 3 * 86400, "leave", "t")
+
+    msgs = [
+        dict(id=1, date=base, sender_id=CHANNEL, text="Пост канала", auto_fwd=1, fwd_date=base),
+        dict(id=2, date=base + 60, sender_id=A, text="Привет всем! @borya смотри", reply_to=1,
+             entities=[{"t": "mention", "o": 13, "l": 6}]),
+        dict(id=3, date=base + 120, sender_id=B, text="Привет, Аня", reply_to=2),
+        dict(id=4, date=base + 180, sender_id=A, text="вот фото", media="photo", media_path=str(media / "p.jpg"),
+             media_state="ok"),
+        dict(id=5, date=base + 240, sender_id=B, text=None, reply_to=4, quote="вот", media="voice",
+             media_meta={"duration": 3}, media_path=str(media / "v.ogg"), media_state="ok"),
+        dict(id=6, date=base + 300, sender_id=C, media="video_note", media_meta={"duration": 2},
+             media_path=str(media / "vn.mp4"), media_state="ok"),
+        dict(id=7, date=base + 360, sender_id=A, text="переслала", fwd_from_id=C, fwd_date=base - 100),
+        # перерыв > 30 мин — новая беседа
+        dict(id=8, date=base + 3 * 3600, sender_id=D, text="есть кто?", media="gif", media_meta={"duration": 1},
+             media_path=str(media / "g.mp4"), media_state="ok"),
+        dict(id=9, date=base + 3 * 3600 + 60, sender_id=C, text="я тут", reply_to=8),
+        dict(id=10, date=base + 3 * 3600 + 120, sender_id=D, media="document",
+             media_meta={"file_name": "doc.pdf", "mime": "application/pdf"}, media_path=str(media / "doc.pdf"),
+             media_state="ok"),
+        dict(id=11, date=base + 3 * 3600 + 180, sender_id=C, media="document",
+             media_meta={"file_name": "notes.txt", "mime": "text/plain"}, media_path=str(media / "notes.txt"),
+             media_state="ok"),
+        dict(id=12, date=NOW - 3600, sender_id=A, text="сегодняшнее", edit_date=NOW - 3500),
+        dict(id=13, date=NOW - 3500, sender_id=B, text="ага https://example.com", reply_to=12),
+    ]
+    with cache.tx() as db:
+        for m in msgs:
+            cache.upsert_message(m, db)
+    cache.set_reactions(3, [(A, "❤", base + 130)])
+    cache.set_reactions(12, [(B, "😂", NOW - 3400), (C, "😂", NOW - 3400)])
+    cache.set_reactions(1, [(A, "👍", base + 10)])       # реакция на пост канала: без «получено»
+    cache.set_transcript(5, "привет это голосовое", 3, "test")
+    cache.set_transcript(6, "кружок с приветом", 2, "test")
+    return cfg, cache
+
+
+def test_stats(env):
+    cfg, cache = env
+    res = S.compute(cache, cfg, now=NOW)
+    ta, tb, tc = res.totals[A]["c"], res.totals[B]["c"], res.totals[C]["c"]
+    assert ta["msgs"] == 4 and ta["comments"] == 1 and ta["forwards"] == 1 and ta["photos"] == 1
+    assert ta["mentions"] == 1 and tb["mentions_recv"] == 1
+    assert tb["replies"] == 2 and tb["quotes"] == 1 and tb["voices"] == 1 and tb["voice_sec"] == 3 and tb["links"] == 1
+    assert tc["video_notes"] == 1 and tc["documents"] == 1
+    assert ta["reactions"] == 2 and ta["reactions_recv"] == 2 and tb["reactions_recv"] == 1
+    assert ta["edits"] == 1
+    assert res.pairs[(B, A)] == {"replies": 2, "quotes": 1, "reactions": 1} and res.pairs[(A, C)]["forwards"] == 1
+    assert res.pairs[(A, B)]["mentions"] == 1 and res.pairs[(A, B)]["reactions"] == 1
+    assert CHANNEL not in res.totals and res.people[CHANNEL]["hidden"]
+    # сегодняшний день в периодах
+    today = datetime.fromtimestamp(NOW, cfg.tz).date()
+    assert res.periods[(A, "d", today)]["msgs"] == 1
+    # время в группе с выходом и возвратом: 5 дней + 5 дней
+    assert res.people[D]["time_in_group_sec"] == 10 * 86400 and not res.people[D]["is_member"]
+    assert res.people[A]["first_join"] == NOW - 35 * 86400
+    # у Вики нет события входа — вход выведен из первого сообщения
+    assert res.people[C]["first_join_exact"] is False
+    assert res.relations[(A, B)]["quant"] == 1.0
+    assert res.group["messages"] == 12 and res.group["members"] == 3
+
+
+def test_windows_and_plan(env):
+    cfg, cache = env
+    an = Analyzer(cfg, cache, db=None, mgr=None)
+    msgs = an.load_messages()
+    eps = segment(msgs, cfg.gap_min, cfg.cast_window)
+    assert [e.id for e in eps] == [1, 8, 12]
+    wins = an.windows(msgs)
+    steps = an.plan(wins, NOW)
+    assert steps == [(0, 3)]          # все три окна закрыты и влезают в один шаг
+    an._mark(wins[0], "done")
+    assert an.plan(wins, NOW) == [(1, 3)]
+    ctx = an._context(wins, 1)
+    assert "Окно #1" in ctx
+
+
+def test_interleave_media(env):
+    cfg, cache = env
+    an = Analyzer(cfg, cache, db=None, mgr=None)
+    wins = an.windows(an.load_messages())
+    budget = an.media.budget(10 ** 6)
+    parts = an.interleave([(f"=== Окно #{w.id} ===", w.msgs) for w in wins[:2]], budget)
+    kinds = [p["type"] for p in parts]
+    assert kinds.count("image_url") >= 1 + 3 + 1       # фото, 3 кадра немого GIF, страница PDF
+    assert kinds.count("audio_url") == 1 and kinds.count("video_url") == 1
+    assert budget.audio_in_video
+    text = "\n".join(p["text"] for p in parts if p["type"] == "text")
+    assert "расшифровка: «привет это голосовое»" in text
+    assert "текст файла:\nсписок покупок" in text
+    # вложение идёт сразу после своего сообщения
+    i = next(i for i, p in enumerate(parts) if p["type"] == "audio_url")
+    assert "#5" in parts[i - 1]["text"]
+    # voice передаётся как есть (ogg), без перекодирования
+    assert parts[i]["audio_url"]["url"].endswith("v.ogg")
+
+
+class FakeLLM:
+    model = None
+
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, messages, schema=None, **kw):
+        self.calls.append((messages, schema, kw))
+        return {"windows": [{"id": 1, "summary": "знакомство", "topics": ["привет"], "mood": "тепло"}],
+                "add": [{"person": A, "section": "facts", "text": "живёт в Саратове", "msgs": [2], "certain": True},
+                        {"person": 999, "section": "facts", "text": "чужой", "msgs": [], "certain": True}],
+                "update": [], "remove": [],
+                "summaries": [{"person": A, "text": "активная участница"}],
+                "relations": [{"a": A, "b": B, "kind": "дружба", "tone": "тёплый", "closeness": 7,
+                               "summary": "друзья"}],
+                "relation_events": [{"a": B, "b": A, "text": "Боря ответил на приветствие", "msgs": [3]}],
+                "relation_notes": [{"a": A, "b": B, "section": "how", "text": "по-дружески", "msgs": [3]}]}
+
+
+class FakeDB:
+    def __init__(self):
+        self.saved = []
+
+    async def people_brief(self, ids):
+        return {}
+
+    async def dossier(self, uid):
+        return None
+
+    async def call(self, fn, *a):
+        return None
+
+    async def save_episode(self, *a):
+        self.saved.append(("episode", a[0]))
+
+    async def save_dossier(self, uid, as_of, summary, content, data):
+        self.saved.append(("dossier", uid, content, data, summary))
+
+    async def save_relation(self, a, b, as_of, llm, kind, tone, summary, description, data):
+        self.saved.append(("relation", a, b, llm, kind, description, data))
+
+    class pool:
+        @staticmethod
+        async def fetch(*a):
+            return []
+
+
+def test_step(env):
+    cfg, cache = env
+    db = FakeDB()
+    an = Analyzer(cfg, cache, db=db, mgr=None)
+    fake = FakeLLM()
+    an._llm = fake
+    an.mgr = type("M", (), {"model": None})()
+    an.stat = {"dossiers": 0, "relations": 0}
+    an._text_cache, an._tok_cache = {}, {}
+    wins = an.windows(an.load_messages())
+    asyncio.run(an.step(wins, 0, 1, NOW))
+    messages, schema, kw = fake.calls[0]
+    content = messages[0]["content"]
+    text = "\n".join(p["text"] for p in content if p["type"] == "text")
+    assert "## Новые окна переписки" in text and "Досье пока нет" in text and "Верни только ПРАВКИ" in text
+    assert kw["audio_in_video"] is True and "add" in schema["properties"]
+    kinds = [x[0] for x in db.saved]
+    assert kinds.count("dossier") == 1 and kinds.count("relation") == 1 and ("episode", 1) in db.saved
+    _, uid, md, data, summary = next(x for x in db.saved if x[0] == "dossier")
+    base_day = datetime.fromtimestamp(NOW - 5 * 86400 + 60, cfg.tz).strftime("%Y-%m-%d")
+    assert uid == A and summary == "активная участница"
+    assert data["entries"][0]["since"] == base_day                 # дата — по сообщению #2
+    assert "живёт в Саратове — *с " + base_day in md and "https://t.me/c/1234567890/2" in md
+    rel = next(x for x in db.saved if x[0] == "relation")
+    assert rel[1:5] == (A, B, 0.7, "дружба") and "Боря ответил на приветствие" in rel[5]
+
+
+def test_dossier_ops():
+    from levbush.dossier import apply_person, empty_dossier, prompt_person, render_person
+    d = empty_dossier()
+    day = lambda msgs: "2025-0%d-01" % (msgs[0] if msgs else 9)  # noqa: E731
+    apply_person(d, {"add": [{"person": 1, "section": "facts", "text": "живёт в Москве", "msgs": [1],
+                              "certain": True},
+                             {"person": 1, "section": "interests", "text": "шахматы", "msgs": [2], "certain": False}]},
+                 1, day)
+    assert "[e1] живёт в Москве (с 2025-01-01)" in prompt_person(d) and "(догадка)" in prompt_person(d)
+    apply_person(d, {"update": [{"person": 1, "entry": "e1", "text": "живёт в Саратове", "msgs": [3],
+                                 "why": "переехал"}],
+                     "remove": [{"person": 1, "entry": "e2", "msgs": [4], "why": "бросил"}]}, 1, day)
+    md = render_person(d, {"id": CHAT})
+    assert "живёт в Саратове — *с 2025-01-01*, *изменено 2025-03-01 (было: «живёт в Москве»)*" in md
+    assert "~~шахматы~~ — *устарело 2025-04-01: бросил*" in md
+    assert "шахматы" not in prompt_person(d)                        # устаревшее нейросети не показываем
+    assert apply_person(d, {"update": [{"person": 2, "entry": "e1", "text": "x", "msgs": [], "why": ""}]}, 1, day) == 0
+
+
+def test_retell_parse():
+    cfg = Config()
+    r = Retell.__new__(Retell)
+    r.cfg = cfg
+    now = datetime(2026, 9, 27, 15, 0, tzinfo=cfg.tz)
+    assert r.parse_since("2ч", now) == now - timedelta(hours=2)
+    assert r.parse_since("30 мин", now) == now - timedelta(minutes=30)
+    assert r.parse_since("14:30", now).hour == 14
+    assert r.parse_since("16:00", now).day == 26                 # в будущем → вчера
+    assert r.parse_since("вчера 20:00", now).day == 26
+    assert r.parse_since("ерунда", now) is None
+
+
+def test_md_to_tg():
+    out = md_to_tg("**Итог**: <b> [→](msg:5)\n- пункт", {"id": CHAT})
+    assert "<b>Итог</b>" in out and "&lt;b&gt;" in out and 'href="https://t.me/c/1234567890/5"' in out
+    assert "• пункт" in out
+
+
+def test_web_auth():
+    token = "123456:TEST"
+    fields = {"auth_date": str(int(time.time())), "user": json.dumps({"id": 42})}
+    key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(key, "\n".join(f"{k}={fields[k]}" for k in sorted(fields)).encode(),
+                              hashlib.sha256).hexdigest()
+    assert auth_user("tma " + urllib.parse.urlencode(fields), token) == 42
+    assert auth_user("tma " + urllib.parse.urlencode(fields) + "x", token) is None
+    login = {"id": 7, "first_name": "Аня", "auth_date": int(time.time())}
+    dcs = "\n".join(f"{k}={login[k]}" for k in sorted(login))
+    login["hash"] = hmac.new(hashlib.sha256(token.encode()).digest(), dcs.encode(), hashlib.sha256).hexdigest()
+    hdr = "tglogin " + base64.b64encode(json.dumps(login, ensure_ascii=False).encode()).decode()
+    assert auth_user(hdr, token) == 7

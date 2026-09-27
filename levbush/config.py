@@ -1,0 +1,132 @@
+"""Настройки из ~/.config/levbush.env (или переменных окружения LEVBUSH_*)."""
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+ENV_FILE = Path(os.environ.get("LEVBUSH_ENV", Path.home() / ".config/levbush.env"))
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_env_file(path: Path) -> dict:
+    out = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key.strip()] = value
+    return out
+
+
+_FILE = _load_env_file(ENV_FILE)
+
+
+def env(name: str, default=None):
+    key = "LEVBUSH_" + name
+    return os.environ.get(key, _FILE.get(key, default))
+
+
+def env_int(name: str, default: int) -> int:
+    value = env(name)
+    return int(value) if value not in (None, "") else default
+
+
+def env_float(name: str, default: float) -> float:
+    value = env(name)
+    return float(value) if value not in (None, "") else default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = env(name)
+    if value in (None, ""):
+        return default
+    return value.strip().lower() in ("1", "yes", "true", "on", "да")
+
+
+def _path(value: str) -> Path:
+    return Path(os.path.expanduser(value))
+
+
+@dataclass
+class Config:
+    bot_token: str = field(default_factory=lambda: env("BOT_TOKEN", ""))
+    admin_id: int = field(default_factory=lambda: env_int("ADMIN_ID", 0))
+    group: str = field(default_factory=lambda: env("GROUP", ""))          # @username / id / ссылка; канал → его группа
+    api_id: int = field(default_factory=lambda: env_int("API_ID", 0))
+    api_hash: str = field(default_factory=lambda: env("API_HASH", ""))
+    database_url: str = field(default_factory=lambda: env("DATABASE_URL", ""))
+    webapp_url: str = field(default_factory=lambda: env("WEBAPP_URL", ""))
+    webapp_name: str = field(default_factory=lambda: env("WEBAPP_NAME", ""))       # короткое имя Mini App (/newapp)
+    tz: ZoneInfo = field(default_factory=lambda: ZoneInfo(env("TZ", "Europe/Moscow")))
+
+    data_dir: Path = field(default_factory=lambda: _path(env("DATA_DIR", "~/.local/share/levbush")))
+    media_dir: Path = field(default_factory=lambda: _path(env("MEDIA_DIR", "/mnt/shared/levbush/media")))
+    session_file: Path = field(default_factory=lambda: _path(env("SESSION", "~/.config/levbush/telethon")))
+    media_max_mb: int = field(default_factory=lambda: env_int("MEDIA_MAX_MB", 300))
+
+    # хранение периодов
+    keep_days: int = field(default_factory=lambda: env_int("KEEP_DAYS", 30))
+    keep_weeks: int = field(default_factory=lambda: env_int("KEEP_WEEKS", 12))
+    keep_months: int = field(default_factory=lambda: env_int("KEEP_MONTHS", 12))
+
+    # эпизоды и сессии
+    gap_min: int = field(default_factory=lambda: env_int("GAP_MIN", 30))            # перерыв, делящий беседы
+    cast_window: int = field(default_factory=lambda: env_int("CAST_WINDOW", 15))    # окно смены «действующих лиц»
+
+    # нейросеть
+    llm_url: str = field(default_factory=lambda: env("LLM_URL", "http://127.0.0.1:18090").rstrip("/"))
+    llm_model: str = field(default_factory=lambda: env("LLM_MODEL", ""))           # пусто — первая из /v1/models
+    llm_autostart: bool = field(default_factory=lambda: env_bool("LLM_AUTOSTART", True))
+    llm_model_path: str = field(default_factory=lambda: env(
+        "LLM_MODEL_PATH", "/mnt/shared/Models/nemotron3-nano-omni-30b-a3b-nvfp4"))
+    llm_ctx: int = field(default_factory=lambda: env_int("LLM_CTX", 131072))
+    llm_seqs: int = field(default_factory=lambda: env_int("LLM_SEQS", 4))
+    llm_parallel: int = field(default_factory=lambda: env_int("LLM_PARALLEL", 4))  # одновременных запросов на медиа
+    llm_idle_stop_min: int = field(default_factory=lambda: env_int("LLM_IDLE_STOP_MIN", 15))
+    llm_need_gib: float = field(default_factory=lambda: env_float("LLM_NEED_GIB", 28.0))
+    llm_think: bool = field(default_factory=lambda: env_bool("LLM_THINK", False))
+    fallback_llm_url: str = field(default_factory=lambda: env("FALLBACK_LLM_URL", "http://127.0.0.1:8080").rstrip("/"))
+    qwen_port: int = field(default_factory=lambda: env_int("QWEN_PORT", 18081))
+    # шаг разбора: несколько последовательных окон + контекст + текущие досье и связи
+    step_tokens: int = field(default_factory=lambda: env_int("STEP_TOKENS", 60000))   # новые окна: текст + медиа
+    step_context_chars: int = field(default_factory=lambda: env_int("STEP_CONTEXT_CHARS", 30000))  # уже разобранные
+    step_relations_chars: int = field(default_factory=lambda: env_int("STEP_RELATIONS_CHARS", 30000))
+    step_max_windows: int = field(default_factory=lambda: env_int("STEP_MAX_WINDOWS", 8))
+    step_max_people: int = field(default_factory=lambda: env_int("STEP_MAX_PEOPLE", 10))
+    # медиа в запросе: лимиты (= --limit-mm-per-prompt сервера) и оценка токенов для планирования
+    mm_images: int = field(default_factory=lambda: env_int("MM_IMAGES", 24))
+    mm_videos: int = field(default_factory=lambda: env_int("MM_VIDEOS", 6))
+    mm_audio: int = field(default_factory=lambda: env_int("MM_AUDIO", 12))
+    tok_image: int = field(default_factory=lambda: env_int("TOK_IMAGE", 1100))
+    tok_audio_sec: float = field(default_factory=lambda: env_float("TOK_AUDIO_SEC", 13))
+    tok_video_frame: int = field(default_factory=lambda: env_int("TOK_VIDEO_FRAME", 140))
+    video_fps: float = field(default_factory=lambda: env_float("VIDEO_FPS", 2))
+    video_max_frames: int = field(default_factory=lambda: env_int("VIDEO_MAX_FRAMES", 128))
+    context_hours: int = field(default_factory=lambda: env_int("CONTEXT_HOURS", 48))   # «два последних дня»
+    pdf_pages: int = field(default_factory=lambda: env_int("PDF_PAGES", 8))           # сколько страниц PDF показывать
+    video_max_sec: int = field(default_factory=lambda: env_int("VIDEO_MAX_SEC", 600))
+
+    asr_python: str = field(default_factory=lambda: env("ASR_PYTHON", "/usr/bin/python3"))
+
+    daily_at: str = field(default_factory=lambda: env("DAILY_AT", "04:30"))
+    stats_interval: int = field(default_factory=lambda: env_int("STATS_INTERVAL", 120))
+    retell_max_hours: int = field(default_factory=lambda: env_int("RETELL_MAX_HOURS", 48))
+
+    @property
+    def cache_db(self) -> Path:
+        return self.data_dir / "cache.db"
+
+    def ensure_dirs(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        self.session_file.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.session_file.parent, 0o700)
+
+
+cfg = Config()
