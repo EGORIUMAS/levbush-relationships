@@ -1,6 +1,6 @@
 """Досье и связи как структурированные записи + правки операциями (без переписывания целиком и без версий).
 
-Досье: {"summary": str, "next": int, "entries": [
+Досье: {"summary": str, "next": int, "names": ["Лёва", "Льва", "Левбуш"], "entries": [
     {"id": "e7", "section": "facts", "text": "…", "since": "2025-03-01", "changed": "2025-06-02" | null,
      "prev": "старый текст" | null, "msgs": [123], "certain": true, "removed": "2025-07-01" | null, "why": "…"}]}
 Когда что появилось, изменилось или устарело — видно по датам прямо в досье.
@@ -16,7 +16,11 @@ REL_NOTES = {"how": "Как общаются", "bond": "Что их связыв
 
 
 def empty_dossier() -> dict:
-    return {"summary": "", "next": 1, "entries": []}
+    return {"summary": "", "next": 1, "names": [], "entries": []}
+
+
+def norm_name(s: str) -> str:
+    return (s or "").strip().lower().replace("ё", "е")
 
 
 def empty_relation() -> dict:
@@ -61,6 +65,12 @@ def apply_person(data: dict, ops: dict, uid: int, day_of) -> int:
         if op.get("person") == uid and op.get("text"):
             data["summary"] = op["text"].strip()[:300]
             n += 1
+    names = data.setdefault("names", [])
+    for op in ops.get("names", []):
+        name = (op.get("name") or "").strip()
+        if op.get("person") == uid and 2 <= len(name) <= 40 and norm_name(name) not in map(norm_name, names):
+            names.append(name)
+            n += 1
     return n
 
 
@@ -84,9 +94,11 @@ def apply_relation(data: dict, ops: dict, a: int, b: int, day_of) -> int:
 # ------------------------------------------------------------ для нейросети (с id записей)
 
 def prompt_person(data: dict | None) -> str:
-    if not data or not data["entries"]:
+    if not data or not (data["entries"] or data.get("names")):
         return "Досье пока нет."
     out = []
+    if data.get("names"):
+        out.append("Как называют: " + ", ".join(data["names"]))
     if data.get("summary"):
         out.append(f"Кратко: {data['summary']}")
     for key, title in SECTIONS.items():
@@ -123,7 +135,7 @@ def _refs(msgs) -> str:
 
 
 def render_person(data: dict, chat: dict) -> str:
-    out = []
+    out = [f"**Как называют:** {', '.join(data['names'])}", ""] if data.get("names") else []
     for key, title in SECTIONS.items():
         items = [e for e in data["entries"] if e["section"] == key]
         if not items:

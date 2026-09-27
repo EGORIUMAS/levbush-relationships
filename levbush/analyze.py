@@ -10,6 +10,7 @@
 """
 import asyncio
 import json
+import re
 import logging
 import time
 from collections import Counter, defaultdict
@@ -19,7 +20,7 @@ from pathlib import Path
 from . import llm as L
 from .cache import Cache
 from .config import ROOT, Config
-from .dossier import (REL_NOTES, SECTIONS, apply_person, apply_relation, empty_dossier, empty_relation,
+from .dossier import (REL_NOTES, SECTIONS, apply_person, apply_relation, empty_dossier, empty_relation, norm_name,
                       prompt_person, prompt_relation, render_person, render_relation)
 from .episodes import Episode, is_closed, segment
 from .gpu import LLMManager
@@ -54,13 +55,14 @@ STEP_SCHEMA = {
         "update": _arr({"person": _INT, "entry": _STR, "text": _STR, "msgs": _MSGS, "why": _STR}),
         "remove": _arr({"person": _INT, "entry": _STR, "msgs": _MSGS, "why": _STR}),
         "summaries": _arr({"person": _INT, "text": _STR}),
+        "names": _arr({"person": _INT, "name": _STR}),
         "relations": _arr({"a": _INT, "b": _INT, "kind": _STR, "tone": _STR,
                            "closeness": {"type": "integer", "minimum": 0, "maximum": 10}, "summary": _STR}),
         "relation_events": _arr({"a": _INT, "b": _INT, "text": _STR, "msgs": _MSGS}),
         "relation_notes": _arr({"a": _INT, "b": _INT, "section": {"type": "string", "enum": list(REL_NOTES)},
                                 "text": _STR, "msgs": _MSGS}),
     },
-    "required": ["windows", "add", "update", "remove", "summaries", "relations", "relation_events",
+    "required": ["windows", "add", "update", "remove", "summaries", "names", "relations", "relation_events",
                  "relation_notes"],
 }
 
@@ -87,6 +89,7 @@ class Analyzer:
         self._llm: L.LLM | None = None
         self._text_cache: dict = {}
         self._tok_cache: dict = {}
+        self._names: dict[int, list[str]] | None = None     # uid → как называют (досье + имя профиля)
         self.stat: dict = {}
 
     async def _progress(self, **kw):
@@ -354,12 +357,56 @@ class Analyzer:
             out.append(text)
         return "\n\n".join(out)
 
+    # ------------------------------------------------------------ имена: узнавать, о ком говорят заочно
+
+    async def _load_names(self):
+        """Имена только из досье («Как называют»): имена профилей вроде «Кто-то» или «Умный кот» — частые слова,
+        по ним искать нельзя. Настоящие имена и их формы вносит сам Nemotron (операция names)."""
+        self._names = {}
+        rows = await self.db.pool.fetch("select user_id, data -> 'names' as names from dossiers")
+        for r in rows:
+            if r["names"]:
+                self._names[r["user_id"]] = list(r["names"])
+        self._build_name_index()
+
+    # падежные окончания русских имён: Лёва → Лёвы/Лёве/Лёвой, Роман → Романа/Романом
+    NAME_ENDINGS = ("", "а", "я", "ы", "и", "е", "у", "ю", "ой", "ей", "ою", "ею", "ом", "ем", "ём", "ь", "о")
+
+    def _build_name_index(self):
+        self._exact, self._stems = defaultdict(set), defaultdict(set)
+        for uid, names in (self._names or {}).items():
+            for name in names:
+                for part in re.findall(r"[^\W\d_]+", norm_name(name)):
+                    if len(part) < 3:
+                        continue
+                    self._exact[part].add(uid)
+                    stem = part[:-1] if part[-1] in "аяыиеуюоьй" else part
+                    if len(stem) >= 3:
+                        self._stems[stem].add(uid)
+
+    def _name_hits(self, text: str) -> Counter:
+        """Сколько раз в тексте названы известные люди: точное имя или основа + падежное окончание."""
+        hits = Counter()
+        for tok in re.findall(r"[^\W\d_]+", norm_name(text)):
+            if len(tok) < 3:
+                continue
+            found = set(self._exact.get(tok, ()))
+            for end in self.NAME_ENDINGS:
+                if tok.endswith(end) and len(tok) - len(end) >= 3:
+                    found |= self._stems.get(tok[:len(tok) - len(end)] if end else tok, set())
+            for uid in found:
+                hits[uid] += 1
+        return hits
+
     def _discussed(self, msgs, writers: set) -> list[int]:
-        """Кого в окнах явно затронули, хотя сам он там не писал: @упоминание/ссылка на профиль, ответ или цитата
-        на его старое сообщение, пересылка его сообщения. По частоте."""
+        """Кого в окнах затронули, хотя сам он там не писал: @упоминание/ссылка на профиль, ответ или цитата
+        на его старое сообщение, пересылка его сообщения, имя из досье («Как называют») или профиля. По частоте."""
         from .normalize import u16_slice
         hits = Counter()
         for m in msgs:
+            if self._names:
+                body = " ".join(x for x in (m["text"], m["quote"], self.cache.transcript(m["id"])) if x)
+                hits.update(self._name_hits(body))
             for e in json.loads(m["entities"]) if m["entities"] else []:
                 if e.get("t") == "text_mention" and e.get("u"):
                     hits[e["u"]] += 1
@@ -386,7 +433,9 @@ class Analyzer:
         lines = []
         for uid in ids:
             s = (briefs.get(uid) or {}).get("summary")
-            lines.append(f"- {self.r.name(uid)}, id {uid}" + (f" — {s}" if s else ""))
+            called = (self._names or {}).get(uid)
+            lines.append(f"- {self.r.name(uid)}, id {uid}" + (f"; как называют: {', '.join(called)}" if called else "")
+                         + (f" — {s}" if s else ""))
         return ids, "\n".join(lines)
 
     async def step(self, wins: list[Episode], first: int, last: int, now: int):
@@ -397,6 +446,8 @@ class Analyzer:
             for w in new:
                 self._mark(w, "done")
             return
+        if self._names is None:
+            await self._load_names()
         discussed = self._discussed(msgs, set(writers))[:self.cfg.step_max_discussed]
         people = writers + discussed               # у них полные досье: можно add / update / remove
         roster_ids, roster = await self._roster(set(people))   # остальные: только add и события связей
@@ -447,6 +498,10 @@ class Analyzer:
             "update и remove — только для записей, показанных в досье выше; summaries — только для людей с "
             "показанным досье.\n"
             "- summaries — одна строка до 140 знаков «кто это в группе», если прежней нет или она устарела.\n"
+            "- names — как называют человека в чате: настоящее имя (если имя в профиле — действительно имя, а не "
+            "слово вроде «Кто-то»), уменьшительные, прозвища, неправильные падежные формы вроде «Льва», если этого "
+            "ещё нет в «Как называют». Только то, что однозначно указывает на этого человека, — не общие слова. По "
+            "этим именам его потом узнают, когда о нём говорят заочно. Можно для любого человека группы.\n"
             "- relations — для пар (a < b), чья связь проявилась в новых окнах и у которых что-то новое: kind "
             "(дружба, флирт, пара, соперничество, коллеги, перепалки, знакомые…), tone, closeness 0–10 (сила и "
             "близость; открытая вражда — тоже сильная связь), summary одной строкой.\n"
@@ -494,7 +549,8 @@ class Analyzer:
 
     async def _apply(self, out: dict, new: list[Episode], people: set, roster: set, as_of: datetime, dossiers: dict,
                      rels: dict):
-        """people — с показанным досье (любые правки); roster — остальные (только add и события/заметки связей)."""
+        """people — с показанным досье (любые правки); roster — остальные (только add, names и события связей)."""
+        allowed_names = people | roster
         by_id = {w.id: w for w in new}
         for item in out.get("windows", []):
             w = by_id.get(item.get("id"))
@@ -510,13 +566,20 @@ class Analyzer:
                 await self.db.save_dossier(uid, as_of, data.get("summary") or None, render_person(data, self.chat), data)
                 self.stat["dossiers"] += 1
         # заочно обсуждаемые из общего списка: только новые записи
-        only_add = {"add": out.get("add", [])}
-        for uid in sorted({o.get("person") for o in out.get("add", [])} & roster):
+        only_add = {"add": out.get("add", []), "names": out.get("names", [])}
+        for uid in sorted({o.get("person") for key in only_add for o in only_add[key]} & roster):
             row = await self.db.dossier(uid)
             data = row["data"] if row and row["data"].get("entries") is not None else empty_dossier()
             if apply_person(data, only_add, uid, day):
                 await self.db.save_dossier(uid, as_of, data.get("summary") or None, render_person(data, self.chat), data)
                 self.stat["dossiers"] += 1
+        if out.get("names") and self._names is not None:
+            for o in out["names"]:
+                if o.get("person") in allowed_names and o.get("name"):
+                    lst = self._names.setdefault(o["person"], [])
+                    if norm_name(o["name"]) not in map(norm_name, lst):
+                        lst.append(o["name"].strip())
+            self._build_name_index()
         allowed = people | roster
         touched = {(min(o["a"], o["b"]), max(o["a"], o["b"]))
                    for key in ("relations", "relation_events", "relation_notes") for o in out.get(key, [])
@@ -562,6 +625,7 @@ class Analyzer:
         started = time.time()
         self.stat = {"transcribed": 0, "windows": 0, "steps": 0, "dossiers": 0, "relations": 0}
         self._text_cache, self._tok_cache = {}, {}
+        self._names = None                       # указатель имён перечитывается из досье в начале прогона
         try:
             self.state = {"state": "running", "reason": reason, "started": int(started)}
             await self._progress(stage="подготовка")

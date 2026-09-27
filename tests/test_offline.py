@@ -9,6 +9,7 @@ import hmac
 import json
 import subprocess
 import time
+from collections import Counter
 import urllib.parse
 from datetime import datetime, timedelta
 
@@ -375,3 +376,24 @@ def test_discussed(env):
             dict(base, id=901, sender_id=B, text="@anya и @gosha", entities=json.dumps(
                 [{"t": "mention", "o": 0, "l": 5}, {"t": "mention", "o": 8, "l": 6}]))]
     assert an._discussed(msgs, {A, B}) == [D]          # A пишет сама — не «обсуждаемая»; D — дважды
+
+
+def test_name_mentions(env):
+    cfg, cache = env
+    from levbush.dossier import apply_person, empty_dossier, prompt_person, render_person
+    an = Analyzer(cfg, cache, db=None, mgr=None)
+    an._names = {D: ["Гоша", "Жора"], B: ["Боря"], 103: ["Вика"]}
+    an._build_name_index()
+    base = {"auto_fwd": 0, "reply_peer": None, "fwd_from_id": None, "entities": None, "reply_to": None, "quote": None}
+    msgs = [dict(base, id=950, sender_id=A, text="Жоры сегодня не было, а Гоше передай привет"),   # падежи
+            dict(base, id=951, sender_id=A, text="Бор и боровик — не про Борю, а Викторина — не Вика?")]
+    got = an._discussed(msgs, {A})
+    assert got[0] == D and B in got
+    assert 103 in got                    # «Вика» в конце фразы — точное совпадение
+    assert an._name_hits("боровик борщ") == Counter()   # короткая основа «бор» не срабатывает
+    # операция names: пополняет «Как называют», без повторов (ё = е)
+    d = empty_dossier()
+    n = apply_person(d, {"names": [{"person": 1, "name": "Лёва"}, {"person": 1, "name": "лева"},
+                                   {"person": 2, "name": "чужое"}]}, 1, lambda m: "2025-01-01")
+    assert n == 1 and d["names"] == ["Лёва"]
+    assert prompt_person(d).startswith("Как называют: Лёва") and "**Как называют:** Лёва" in render_person(d, {})
