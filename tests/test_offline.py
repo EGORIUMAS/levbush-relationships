@@ -112,8 +112,8 @@ def test_stats(env):
     assert res.pairs[(A, B)]["mentions"] == 1 and res.pairs[(A, B)]["reactions"] == 1
     assert CHANNEL not in res.totals and res.people[CHANNEL]["hidden"]
     # сегодняшний день в периодах
-    today = datetime.fromtimestamp(NOW, cfg.tz).date()
-    assert res.periods[(A, "d", today)]["msgs"] == 1
+    day12 = datetime.fromtimestamp(NOW - 3600, cfg.tz).date()      # день сообщения #12 (у полуночи — вчера)
+    assert res.periods[(A, "d", day12)]["msgs"] == 1
     # время в группе с выходом и возвратом: 5 дней + 5 дней
     assert res.people[D]["time_in_group_sec"] == 10 * 86400 and not res.people[D]["is_member"]
     assert res.people[A]["first_join"] == NOW - 35 * 86400
@@ -283,3 +283,32 @@ def test_web_auth():
     login["hash"] = hmac.new(hashlib.sha256(token.encode()).digest(), dcs.encode(), hashlib.sha256).hexdigest()
     hdr = "tglogin " + base64.b64encode(json.dumps(login, ensure_ascii=False).encode()).decode()
     assert auth_user(hdr, token) == 7
+
+
+def test_tg_pacing(env, monkeypatch):
+    from telethon import errors
+    from levbush.tg_client import TG
+    cfg, cache = env
+    tg = TG(cfg, cache)
+    slept = []
+
+    async def fake_sleep(sec):
+        slept.append(sec)
+
+    monkeypatch.setattr("levbush.tg_client.asyncio.sleep", fake_sleep)
+    calls = []
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise errors.FloodWaitError(request=None, capture=30)
+        return "ok"
+
+    async def go():
+        assert await tg.req("reactions", flaky) == "ok"
+        await tg.pace("reactions")
+
+    asyncio.run(go())
+    assert len(calls) == 2 and tg.floods == 1 and tg.slow == 2.0
+    assert any(s >= 30 * 1.1 for s in slept)                      # ждали FloodWait с запасом
+    assert slept[-1] >= cfg.tg_reaction_delay * 2 * 0.9           # и дальше идём в два раза медленнее

@@ -1,6 +1,7 @@
 """База (Supabase Postgres сейчас, локальный Postgres потом) через asyncpg.
 
-Строка подключения — LEVBUSH_DATABASE_URL. Для Supabase — Session pooler (IPv4), порт 5432.
+Строка подключения — LEVBUSH_DATABASE_URL. Для Supabase — Transaction pooler, порт 6543: через VPN sbx
+порт 5432 рвётся сразу после рукопожатия. Подготовленные запросы поэтому выключены (statement_cache_size=0).
 """
 import hashlib
 import hmac

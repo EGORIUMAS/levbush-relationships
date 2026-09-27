@@ -2,6 +2,10 @@
 
 Сессией владеет один процесс (файловая блокировка): обычно это `levbush run`; CLI-команды `sync` и т.п.
 работают, только когда бот остановлен.
+
+Бережно к лимитам Telegram (аккаунт живой): каждый запрос идёт через pace() с паузой своего вида
+(TG_*_DELAY), FloodWait не проглатывается молча — ждём сколько сказано +10 % и замедляем весь темп вдвое
+(до ×16); через 30 мин без FloodWait темп постепенно возвращается.
 """
 import asyncio
 import base64
@@ -9,6 +13,7 @@ import fcntl
 import io
 import logging
 import os
+import random
 import time
 from pathlib import Path
 
@@ -52,6 +57,52 @@ class TG:
         self.channel_id: int | None = None
         self._lock_fd = None
         self.io_lock = asyncio.Lock()   # одна тяжёлая операция с API за раз
+        self.slow = 1.0                 # множитель пауз, растёт после FloodWait
+        self._last: dict[str, float] = {}
+        self._last_flood = 0.0
+        self.floods = 0
+        self._delays = {"history": cfg.tg_history_delay, "reactions": cfg.tg_reaction_delay,
+                        "media": cfg.tg_media_delay, "profile": cfg.tg_profile_delay, "misc": 1.0}
+
+    # ------------------------------------------------------------ темп запросов
+
+    async def pace(self, kind: str):
+        now = time.monotonic()
+        if self.slow > 1 and now - self._last_flood > 1800:
+            self.slow = max(1.0, self.slow / 2)
+            self._last_flood = now
+        delay = self._delays.get(kind, 1.0) * self.slow
+        wait = self._last.get(kind, 0.0) + delay - now
+        if wait > 0:
+            await asyncio.sleep(wait + random.uniform(0, delay * 0.25))
+        self._last[kind] = time.monotonic()
+
+    async def flood(self, exc: errors.FloodWaitError):
+        self.floods += 1
+        self.slow = min(16.0, self.slow * 2)
+        self._last_flood = time.monotonic()
+        log.warning("FloodWait %s с — жду и замедляюсь (темп ×%.0f)", exc.seconds, self.slow)
+        await asyncio.sleep(exc.seconds * 1.1 + 5)
+
+    async def req(self, kind: str, fn, *args, **kwargs):
+        """Один запрос с паузой и повтором после FloodWait."""
+        for _ in range(6):
+            await self.pace(kind)
+            try:
+                return await fn(*args, **kwargs)
+            except errors.FloodWaitError as exc:
+                await self.flood(exc)
+        raise RuntimeError("Telegram раз за разом отвечает FloodWait — остановился")
+
+    async def collect(self, kind: str, make_iter):
+        """Список из итератора Telethon; после FloodWait — заново (для коротких списков: участники, журнал)."""
+        for _ in range(6):
+            await self.pace(kind)
+            try:
+                return [x async for x in make_iter()]
+            except errors.FloodWaitError as exc:
+                await self.flood(exc)
+        raise RuntimeError("Telegram раз за разом отвечает FloodWait — остановился")
 
     # ------------------------------------------------------------ подключение
 
@@ -71,7 +122,7 @@ class TG:
         self.cfg.ensure_dirs()
         self._take_lock()
         self.client = TelegramClient(str(self.cfg.session_file), self.cfg.api_id, self.cfg.api_hash,
-                                     flood_sleep_threshold=120, device_model="Levbush Relationships",
+                                     flood_sleep_threshold=0, device_model="Levbush Relationships",
                                      system_version="Linux", app_version="1.0")
         if interactive:
             await self.client.start()
@@ -95,10 +146,16 @@ class TG:
     async def _find_group(self, target: str):
         """@username / ссылка / id в любом виде: -100…, -…, голый id (разные клиенты показывают по-разному)."""
         if not target.lstrip("-").isdigit():
-            return await self.client.get_entity(target)
+            return await self.req("misc", self.client.get_entity, target)
         raw = target.lstrip("-")
         bare = int(raw[3:]) if target.startswith("-100") and len(raw) > 10 else int(raw)
-        async for d in self.client.iter_dialogs():
+        known = (self.cache.get("chat") or {}).get("id")
+        if known and str(known).endswith(str(bare)):
+            try:            # уже находили — берём из сессии, без перебора диалогов
+                return await self.req("misc", self.client.get_entity, tt.PeerChannel(bare))
+            except (ValueError, errors.RPCError):
+                pass
+        for d in await self.collect("misc", lambda: self.client.iter_dialogs()):
             if getattr(d.entity, "id", None) == bare and not isinstance(d.entity, tt.User):
                 return d.entity
         for guess in (int(f"-100{bare}"), -bare):
@@ -114,15 +171,15 @@ class TG:
         entity = await self._find_group(self.cfg.group.strip())
         channel = None
         if isinstance(entity, tt.Channel):
-            full = await self.client(functions.channels.GetFullChannelRequest(entity))
+            full = await self.req("misc", self.client, functions.channels.GetFullChannelRequest(entity))
             linked = full.full_chat.linked_chat_id
             if entity.broadcast:
                 if not linked:
                     raise RuntimeError(f"у канала «{entity.title}» нет группы обсуждения")
                 channel = entity
-                entity = await self.client.get_entity(tt.PeerChannel(linked))
+                entity = await self.req("misc", self.client.get_entity, tt.PeerChannel(linked))
             elif linked:
-                channel = await self.client.get_entity(tt.PeerChannel(linked))
+                channel = await self.req("misc", self.client.get_entity, tt.PeerChannel(linked))
         self.chat = entity
         self.chat_id = tu.get_peer_id(entity)
         self.channel_id = tu.get_peer_id(channel) if channel else None
@@ -141,7 +198,6 @@ class TG:
         on_change() вызывается после каждой записи в кэш (бот помечает статистику устаревшей)."""
         from telethon import events
         c = self.client
-        self._reaction_queue: set[int] = set()
 
         def changed():
             if on_change:
@@ -150,8 +206,7 @@ class TG:
         @c.on(events.NewMessage(chats=self.chat))
         @c.on(events.MessageEdited(chats=self.chat))
         async def _msg(ev):
-            need = self._store_batch([ev.message])
-            self._reaction_queue.update(need)
+            self._store_batch([ev.message])
             changed()
 
         @c.on(events.ChatAction(chats=self.chat))
@@ -187,60 +242,68 @@ class TG:
                 if len(recent) >= sum(counts.values()) or not res.can_see_list:
                     self.cache.set_reactions(update.msg_id, [r for r in recent if r[0] and r[1]], db)
                 else:
-                    self._reaction_queue.add(update.msg_id)
+                    db.execute("insert or ignore into reaction_todo(msg_id) values (?)", (update.msg_id,))
             changed()
 
-    async def flush_reactions(self):
-        """Догружает поимённые списки реакций, накопленные живым сбором (вызывается раз в минуту)."""
-        ids = sorted(getattr(self, "_reaction_queue", ()))
-        if not ids:
+    async def flush_reactions(self, limit: int = 30):
+        """Догружает поимённые списки реакций из очереди (живой сбор и история). Раз в минуту, понемногу."""
+        if self.io_lock.locked():
             return 0
-        self._reaction_queue.clear()
         async with self.io_lock:
-            await self._fetch_reaction_lists(ids)
-        return len(ids)
+            return await self.process_reaction_todo(limit=limit)
 
     # ------------------------------------------------------------ история
 
     async def sync_history(self, progress=None, full_reactions: bool = True) -> int:
-        """Докачивает всё после курсора sync_upto (первый раз — всю историю). Возвращает число сообщений."""
+        """Докачивает всё после курсора sync_upto (первый раз — всю историю). Возвращает число сообщений.
+        Поимённые списки реакций копятся в очереди reaction_todo; full_reactions — разобрать её сразу."""
         async with self.io_lock:
             upto = self.cache.get("sync_upto", 0)
             n = 0
-            batch = []
-            reaction_queue = []
             last_report = time.monotonic()
             total = None
             if progress:
                 try:
-                    total = (await self.client.get_messages(self.chat, limit=0)).total
+                    total = (await self.req("history", self.client.get_messages, self.chat, limit=0)).total
                 except Exception:  # noqa: BLE001
                     total = None
-            async for msg in self.client.iter_messages(self.chat, reverse=True, min_id=upto, wait_time=0):
-                batch.append(msg)
-                if len(batch) >= 200:
-                    reaction_queue += self._store_batch(batch)
-                    upto = batch[-1].id
-                    self.cache.set("sync_upto", upto)
-                    n += len(batch)
-                    batch = []
-                    if progress and time.monotonic() - last_report > 5:
-                        last_report = time.monotonic()
-                        await progress(n, total)
-            if batch:
-                reaction_queue += self._store_batch(batch)
-                upto = batch[-1].id
-                self.cache.set("sync_upto", upto)
-                n += len(batch)
-            if full_reactions and reaction_queue:
-                await self._fetch_reaction_lists(reaction_queue, progress)
+            while True:
+                batch = []
+                try:
+                    await self.pace("history")
+                    wait = self._delays["history"] * self.slow
+                    async for msg in self.client.iter_messages(self.chat, reverse=True, min_id=upto, wait_time=wait):
+                        batch.append(msg)
+                        if len(batch) >= 100:
+                            self._store_batch(batch)
+                            upto = batch[-1].id
+                            self.cache.set("sync_upto", upto)
+                            n += len(batch)
+                            batch = []
+                            if progress and time.monotonic() - last_report > 10:
+                                last_report = time.monotonic()
+                                await progress(n, total)
+                    if batch:
+                        self._store_batch(batch)
+                        upto = batch[-1].id
+                        self.cache.set("sync_upto", upto)
+                        n += len(batch)
+                    break
+                except errors.FloodWaitError as exc:
+                    if batch:
+                        self._store_batch(batch)
+                        upto = batch[-1].id
+                        self.cache.set("sync_upto", upto)
+                        n += len(batch)
+                    await self.flood(exc)            # и продолжаем с курсора
+            if full_reactions:
+                await self.process_reaction_todo(progress=progress)
             self.cache.set("history_synced", True)
             self.cache.set("last_sync", int(time.time()))
             return n
 
-    def _store_batch(self, batch) -> list[int]:
-        """Пишет пачку сообщений в кэш; возвращает id, у которых список реакций надо догрузить."""
-        need = []
+    def _store_batch(self, batch):
+        """Пишет пачку сообщений в кэш; сообщения, где нужен поимённый список реакций, — в очередь reaction_todo."""
         with self.cache.tx() as db:
             for msg in batch:
                 row = from_telethon(msg, self.chat_id, self.channel_id)
@@ -262,13 +325,12 @@ class TG:
                     if len(recent) >= total:
                         self.cache.set_reactions(msg.id, [r for r in recent if r[0] and r[1]], db)
                     elif can_list:
-                        need.append(msg.id)
+                        db.execute("insert or ignore into reaction_todo(msg_id) values (?)", (msg.id,))
                     else:
                         self.cache.set_reactions(msg.id, [r for r in recent if r[0] and r[1]], db)
                 else:
                     db.execute("delete from reaction_counts where msg_id = ?", (msg.id,))
                     db.execute("delete from reactions where msg_id = ?", (msg.id,))
-        return need
 
     def _membership_from_service(self, msg, row, db):
         name = row.get("service")
@@ -283,48 +345,54 @@ class TG:
             for uid in data.get("users", []):
                 self.cache.add_membership(uid, date, "leave", "service", db)
 
-    async def _fetch_reaction_lists(self, ids, progress=None):
-        """Поимённый список реакций (messages.getMessageReactionsList) для сообщений, где он не весь в recent."""
-        done = 0
-        for msg_id in ids:
-            pairs = []
-            offset = None
+    async def _reaction_list(self, msg_id: int) -> list | None:
+        """Поимённый список реакций (messages.getMessageReactionsList); None — недоступен."""
+        pairs, offset = [], None
+        while True:
             try:
-                while True:
-                    res = await self.client(functions.messages.GetMessageReactionsListRequest(
-                        peer=self.chat, id=msg_id, limit=100, offset=offset))
-                    for r in res.reactions:
-                        key = reaction_key(r.reaction)
-                        if key:
-                            pairs.append((tu.get_peer_id(r.peer_id), key, int(r.date.timestamp()) if r.date else None))
-                    for u in res.users:
-                        self.cache.upsert_user(tt_user_row(u))
-                    offset = res.next_offset
-                    if not offset:
-                        break
-            except errors.FloodWaitError as exc:
-                log.warning("FloodWait %s с на списке реакций", exc.seconds)
-                await asyncio.sleep(exc.seconds + 1)
-                continue
+                res = await self.req("reactions", self.client, functions.messages.GetMessageReactionsListRequest(
+                    peer=self.chat, id=msg_id, limit=100, offset=offset))
             except errors.RPCError as exc:
                 log.info("реакции #%s недоступны: %s", msg_id, exc)
-                continue
+                return None
+            for r in res.reactions:
+                key = reaction_key(r.reaction)
+                if key:
+                    pairs.append((tu.get_peer_id(r.peer_id), key, int(r.date.timestamp()) if r.date else None))
+            for u in res.users:
+                self.cache.upsert_user(tt_user_row(u))
+            offset = res.next_offset
+            if not offset:
+                return pairs
+
+    async def process_reaction_todo(self, limit: int | None = None, progress=None) -> int:
+        """Разбирает очередь reaction_todo (переживает перезапуск). Вызывать под io_lock."""
+        total = self.cache.db.execute("select count(*) from reaction_todo").fetchone()[0]
+        done = 0
+        while limit is None or done < limit:
+            row = self.cache.db.execute("select msg_id from reaction_todo order by msg_id desc limit 1").fetchone()
+            if row is None:
+                break
+            msg_id = row[0]
+            pairs = await self._reaction_list(msg_id)
             with self.cache.tx() as db:
-                self.cache.set_reactions(msg_id, pairs, db)
+                if pairs is not None:
+                    self.cache.set_reactions(msg_id, pairs, db)
+                db.execute("delete from reaction_todo where msg_id = ?", (msg_id,))
             done += 1
-            if progress and done % 200 == 0:
-                await progress(done, len(ids), "реакции")
+            if progress and done % 100 == 0:
+                await progress(done, total, "реакции поимённо")
+        return done
 
     async def refresh_reactions(self, since_ts: int):
-        """Перечитывает реакции на сообщения за последние дни (бот ловит новые, но не всё и не всегда)."""
+        """Перечитывает реакции на сообщения за последние дни (живые обновления приходят не всегда)."""
         async with self.io_lock:
             ids = [r[0] for r in self.cache.db.execute(
                 "select id from messages where date >= ? and service is null", (since_ts,))]
             for i in range(0, len(ids), 100):
-                msgs = await self.client.get_messages(self.chat, ids=ids[i:i + 100])
-                need = self._store_batch([m for m in msgs if m is not None])
-                if need:
-                    await self._fetch_reaction_lists(need)
+                msgs = await self.req("history", self.client.get_messages, self.chat, ids=ids[i:i + 100])
+                self._store_batch([m for m in msgs if m is not None])
+            await self.process_reaction_todo()
 
     # ------------------------------------------------------------ участники
 
@@ -332,7 +400,8 @@ class TG:
         async with self.io_lock:
             now = int(time.time())
             present = set()
-            users = [u async for u in self.client.iter_participants(self.chat)]   # до транзакции: сеть не держит блокировку
+            # до транзакции: сеть не держит блокировку кэша
+            users = await self.collect("misc", lambda: self.client.iter_participants(self.chat))
             with self.cache.tx() as db:
                 for user in users:
                     row = tt_user_row(user)
@@ -353,7 +422,9 @@ class TG:
                             self.cache.add_membership(uid, now, "leave", "participants_diff", db)
                 db.execute("update users set is_member = 0 where is_member is null and kind = 'user'")
             try:
-                async for ev in self.client.iter_admin_log(self.chat, join=True, leave=True, invite=True):
+                log_events = await self.collect(
+                    "misc", lambda: self.client.iter_admin_log(self.chat, join=True, leave=True, invite=True))
+                for ev in log_events:
                     date = int(ev.date.timestamp())
                     act = ev.action
                     if isinstance(act, (tt.ChannelAdminLogEventActionParticipantJoin,
@@ -381,22 +452,20 @@ class TG:
                 "(select value from kv where key = 'profile:' || u.id), '$') as integer), 0) < ?", (limit,)).fetchall()
             for uid, photo_id, kind in rows:
                 try:
-                    entity = await self.client.get_entity(uid)
+                    entity = await self.req("profile", self.client.get_entity, uid)
                     row = tt_user_row(entity)
                     if kind == "user" and isinstance(entity, tt.User):
-                        full = await self.client(functions.users.GetFullUserRequest(entity))
+                        full = await self.req("profile", self.client, functions.users.GetFullUserRequest(entity))
                         row["bio"] = full.full_user.about
                     if entity.photo and not isinstance(entity.photo, (tt.UserProfilePhotoEmpty, tt.ChatPhotoEmpty)):
-                        raw = await self.client.download_profile_photo(entity, file=bytes, download_big=False)
+                        raw = await self.req("profile", self.client.download_profile_photo, entity, file=bytes,
+                                             download_big=False)
                         if raw:
                             row["avatar"] = avatar_data_uri(raw)
                     self.cache.upsert_user(row)
-                except errors.FloodWaitError as exc:
-                    await asyncio.sleep(exc.seconds + 1)
                 except (errors.RPCError, ValueError) as exc:
                     log.info("профиль %s: %s", uid, exc)
                 self.cache.set(f"profile:{uid}", int(time.time()))
-                await asyncio.sleep(0.3)
 
     # ------------------------------------------------------------ медиа
 
@@ -425,7 +494,7 @@ class TG:
         async with self.io_lock:
             for i in range(0, len(rows), 50):
                 chunk = rows[i:i + 50]
-                msgs = await self.client.get_messages(self.chat, ids=[r["id"] for r in chunk])
+                msgs = await self.req("media", self.client.get_messages, self.chat, ids=[r["id"] for r in chunk])
                 for r, msg in zip(chunk, msgs):
                     meta = json.loads(r["media_meta"]) if r["media_meta"] else {}
                     if msg is None or msg.media is None:
@@ -438,11 +507,9 @@ class TG:
                     path = self.media_path(r["id"], r["date"], r["media"], meta)
                     path.parent.mkdir(parents=True, exist_ok=True)
                     try:
-                        await self.client.download_media(msg, file=str(path))
+                        await self.req("media", self.client.download_media, msg, file=str(path))
                         self.cache.set_media(r["id"], "ok", str(path))
                         done += 1
-                    except errors.FloodWaitError as exc:
-                        await asyncio.sleep(exc.seconds + 1)
                     except Exception as exc:  # noqa: BLE001 — один битый файл не останавливает загрузку
                         log.warning("медиа #%s: %s", r["id"], exc)
                         self.cache.set_media(r["id"], "error")

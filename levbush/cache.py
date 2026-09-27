@@ -60,6 +60,11 @@ create table if not exists reaction_counts (
     primary key (msg_id, emoji)
 );
 
+-- сообщения, для которых надо догрузить поимённый список реакций (очередь переживает перезапуск)
+create table if not exists reaction_todo (
+    msg_id integer primary key
+);
+
 create table if not exists users (
     id          integer primary key,
     kind        text not null default 'user',

@@ -42,7 +42,7 @@ Telegram ──Bot API──► levbush run (бот: только команды
    Для входа на сайте — `/setdomain` → `egoriumas.github.io`; для Mini App — `/newapp` (URL сайта).
 2. **Telethon**: my.telegram.org → API development tools → `api_id`, `api_hash`.
 3. **База**: Supabase, проект `levbush-relationships` уже создан, схема и Edge Function задеплоены.
-   Нужна строка подключения: Project Settings → Database → Connection string → **Session pooler**
+   Нужна строка подключения: Connect → **Transaction pooler** (порт 6543 — 5432 через VPN sbx не проходит)
    (пароль — «Reset database password»).
 4. Настройки: `cp deploy/levbush.env.example ~/.config/levbush.env && chmod 600 ~/.config/levbush.env`, заполнить.
 5. Вход Telethon (интерактивно, один раз): `~/.local/share/levbush/venv/bin/python -m levbush login`
@@ -53,14 +53,19 @@ Telegram ──Bot API──► levbush run (бот: только команды
    systemctl --user daemon-reload && systemctl --user enable --now levbush
    journalctl --user -u levbush -f
    ```
-   При первом старте бот качает всю историю, медиа и профили, выгружает статистику и спрашивает админа,
-   запускать ли первый разбор.
+8. В личке боту (от `LEVBUSH_ADMIN_ID`): **`/initiate`** — только после этого начинается сбор: участники →
+   вся история → реакции поимённо → профили → медиа, дальше — живой сбор. Затем бот выгружает статистику и
+   спрашивает, запускать ли первый разбор нейросетью. Флаг сохраняется: после перезапуска сбор продолжается сам.
+
+Telegram-лимиты: паузы `LEVBUSH_TG_HISTORY_DELAY` (1 с на 100 сообщений), `TG_REACTION_DELAY` (1,5 с),
+`TG_MEDIA_DELAY` (0,7 с), `TG_PROFILE_DELAY` (2 с); FloodWait — ждём +10 % и замедляемся вдвое (до ×16),
+через 30 мин без FloodWait темп восстанавливается. Счётчик FloodWait и текущий темп — в `/status`.
 
 ## Команды бота
 
 `/stats [@ник]` (или ответом) · `/me` · `/top [метрика] [d|w|m|a]` · `/pair @a [@b]` · `/dossier [@ник]` ·
 `/links [@ник]` · `/retell 2ч | 30м | 14:30 | вчера 20:00` (или ответом на сообщение; не дальше 48 ч) · `/map`.
-Админ: `/status`, `/analyze`, `/sync`. Доступ — участникам группы.
+Админ: `/initiate`, `/status`, `/analyze`, `/sync`. Доступ — участникам группы.
 
 ## CLI
 

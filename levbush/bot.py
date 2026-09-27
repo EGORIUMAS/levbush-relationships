@@ -84,6 +84,10 @@ class Levbush:
     # ================================================================ служебное
 
     @property
+    def initiated(self) -> bool:
+        return bool(self.cache.get("initiated"))
+
+    @property
     def chat(self) -> dict:
         return self.cache.get("chat", {}) or {}
 
@@ -154,7 +158,6 @@ class Levbush:
         try:
             await self.tg.connect()
             self.tg_ok = True
-            self.tg.start_live(on_change=self.mark_dirty)
         except (SessionBusy, RuntimeError) as exc:
             log.error("Telethon: %s", exc)
             await self.notify_admin(f"⚠️ Telethon не подключён: {exc}\nИстория и медиа не качаются, "
@@ -190,8 +193,12 @@ class Levbush:
         hh, mm = (int(x) for x in self.cfg.daily_at.split(":"))
         jq.run_daily(self.job_daily, time=datetime.now(self.cfg.tz).replace(hour=hh, minute=mm, second=0,
                                                                            microsecond=0).timetz())
-        if self.tg_ok:
+        if self.tg_ok and self.initiated:
+            self.tg.start_live(on_change=self.mark_dirty)
             self.spawn(self.startup_sync(), "синхронизация")
+        elif self.tg_ok:
+            await self.notify_admin("✅ Бот запущен, Telethon подключён к «" + str(self.chat.get("title")) + "».\n"
+                                    "Сбор ещё не запускался — /initiate, когда будешь готов.")
 
     async def post_shutdown(self, app: Application):
         for t in list(self.bg):
@@ -263,21 +270,21 @@ class Levbush:
         self.dirty = True
 
     async def job_reactions(self, ctx):
-        if self.tg_ok:
+        if self.tg_ok and self.initiated and not self.busy("синхронизация"):
             try:
                 await self.tg.flush_reactions()
             except Exception:  # noqa: BLE001
                 log.exception("реакции")
 
     async def job_media(self, ctx):
-        if self.tg_ok and not self.busy("синхронизация"):
+        if self.tg_ok and self.initiated and not self.busy("синхронизация"):
             try:
                 await self.tg.download_pending(limit=200)
             except Exception:  # noqa: BLE001
                 log.exception("медиа")
 
     async def job_participants(self, ctx):
-        if self.tg_ok and not self.busy("синхронизация"):
+        if self.tg_ok and self.initiated and not self.busy("синхронизация"):
             try:
                 await self.tg.sync_participants()
                 self.dirty = True
@@ -285,7 +292,8 @@ class Levbush:
                 log.exception("участники")
 
     async def job_daily(self, ctx):
-        self.spawn(self.daily(), "ежедневный разбор")
+        if self.initiated and not self.busy("ежедневный разбор"):
+            self.spawn(self.daily(), "ежедневный разбор")
 
     async def daily(self):
         if self.tg_ok:
@@ -307,7 +315,7 @@ class Levbush:
 
     async def on_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         m = update.effective_message
-        if m is None or not self.in_group(update):
+        if m is None or not self.in_group(update) or not self.initiated:
             return
         row = from_ptb(m)
         if row is None:
@@ -410,7 +418,7 @@ class Levbush:
             f"/retell 2ч | 30м | 14:30 | вчера 20:00 — пересказ (не дальше {self.cfg.retell_max_hours} ч), "
             "или ответом на сообщение — с него\n/map — карта связей")
         if self.is_admin(update):
-            text += "\n\nАдмин: /status, /analyze, /sync"
+            text += "\n\nАдмин: /initiate (запуск сбора), /status, /analyze, /sync"
         btn = self.map_button(update)
         await self.reply(update, text, InlineKeyboardMarkup([[btn]]) if btn else None)
 
@@ -653,6 +661,9 @@ class Levbush:
         if now - since > timedelta(hours=self.cfg.retell_max_hours):
             await self.reply(update, f"Пересказ — не дальше чем на {self.cfg.retell_max_hours} ч назад.")
             return
+        if not self.initiated:
+            await self.reply(update, "Сбор переписки ещё не запущен — пересказывать нечего.")
+            return
         if self.retell_lock.locked():
             await self.reply(update, "⏳ Уже готовлю другой пересказ, подожди немного.")
             return
@@ -703,6 +714,9 @@ class Levbush:
             f"Nemotron: {'работает' if await self.mgr.is_up() else 'не запущен'}",
             f"Разбор: {esc(st.get('state', '—'))} {esc(st.get('stage', ''))} "
             + (f"{st.get('done')}/{st.get('total')}" if st.get("total") else ""),
+            f"Сбор: {'запущен' if self.initiated else 'не запускался (/initiate)'}; очередь реакций "
+            f"{c.execute('select count(*) from reaction_todo').fetchone()[0]}; темп ×{self.tg.slow:g}, "
+            f"FloodWait: {self.tg.floods}",
             "Задачи: " + (", ".join(t.get_name() for t in self.bg) or "нет"),
         ]
         await self.reply(update, "\n".join(lines))
@@ -716,11 +730,28 @@ class Levbush:
         self.spawn(self.analyzer.run("вручную"), "разбор")
         await self.reply(update, "🧠 Запустил разбор. Прогресс — /status и на карте.")
 
-    async def cmd_sync(self, update: Update, ctx):
+    async def cmd_initiate(self, update: Update, ctx):
         if not self.is_admin(update):
             return
         if not self.tg_ok:
-            await self.reply(update, "Telethon не подключён.")
+            await self.reply(update, "Telethon не подключён — смотри лог: journalctl --user -u levbush")
+            return
+        if self.initiated:
+            await self.reply(update, "Сбор уже запущен. Прогресс — /status.")
+            return
+        self.cache.set("initiated", int(time.time()))
+        self.tg.start_live(on_change=self.mark_dirty)
+        self.spawn(self.startup_sync(), "синхронизация")
+        d = self.cfg
+        await self.reply(update, "📥 Запускаю сбор: участники → вся история (пауза "
+                                 f"{d.tg_history_delay:g} с на 100 сообщений) → реакции поимённо ({d.tg_reaction_delay:g} с "
+                                 f"на сообщение) → профили → медиа. При FloodWait жду и замедляюсь. Прогресс — /status.")
+
+    async def cmd_sync(self, update: Update, ctx):
+        if not self.is_admin(update):
+            return
+        if not self.tg_ok or not self.initiated:
+            await self.reply(update, "Сбор не запущен — /initiate.")
             return
         if self.busy("синхронизация"):
             await self.reply(update, "Уже синхронизируюсь.")
@@ -782,7 +813,8 @@ def build(config: Config = cfg) -> Application:
     app.bot_data["levbush"] = lb
     cmds = {"help": lb.cmd_help, "start": lb.cmd_help, "stats": lb.cmd_stats, "me": lb.cmd_me, "top": lb.cmd_top,
             "pair": lb.cmd_pair, "dossier": lb.cmd_dossier, "links": lb.cmd_links, "map": lb.cmd_map,
-            "retell": lb.cmd_retell, "status": lb.cmd_status, "analyze": lb.cmd_analyze, "sync": lb.cmd_sync}
+            "retell": lb.cmd_retell, "status": lb.cmd_status, "analyze": lb.cmd_analyze, "sync": lb.cmd_sync,
+            "initiate": lb.cmd_initiate}
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, fn), group=1)
     # сбор — отдельной группой обработчиков, чтобы команды в группе тоже попадали в кэш

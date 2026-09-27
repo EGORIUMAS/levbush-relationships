@@ -68,6 +68,11 @@ class Config:
     data_dir: Path = field(default_factory=lambda: _path(env("DATA_DIR", "~/.local/share/levbush")))
     media_dir: Path = field(default_factory=lambda: _path(env("MEDIA_DIR", "/mnt/shared/levbush/media")))
     session_file: Path = field(default_factory=lambda: _path(env("SESSION", "~/.config/levbush/telethon")))
+    # паузы между запросами Telethon, с (аккуратно с лимитами: аккаунт живой)
+    tg_history_delay: float = field(default_factory=lambda: env_float("TG_HISTORY_DELAY", 1.0))    # на 100 сообщений
+    tg_reaction_delay: float = field(default_factory=lambda: env_float("TG_REACTION_DELAY", 1.5))
+    tg_media_delay: float = field(default_factory=lambda: env_float("TG_MEDIA_DELAY", 0.7))
+    tg_profile_delay: float = field(default_factory=lambda: env_float("TG_PROFILE_DELAY", 2.0))
     media_max_mb: int = field(default_factory=lambda: env_int("MEDIA_MAX_MB", 300))
 
     # хранение периодов
