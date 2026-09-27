@@ -208,10 +208,17 @@ def tt_reactions(msg):
 def tt_user_row(entity) -> dict:
     """Пользователь/канал Telethon → строка users."""
     if isinstance(entity, tt.User):
-        return {"id": entity.id, "kind": "user", "first_name": entity.first_name or ("Удалённый аккаунт" if entity.deleted else None),
-                "last_name": entity.last_name, "username": entity.username or _first_username(entity),
-                "is_bot": int(bool(entity.bot)), "is_premium": int(bool(entity.premium)), "lang": entity.lang_code,
-                "photo_id": getattr(entity.photo, "photo_id", None)}
+        row = {"id": entity.id, "kind": "user",
+               "first_name": entity.first_name or ("Удалённый аккаунт" if entity.deleted else None),
+               "last_name": entity.last_name, "username": entity.username or _first_username(entity),
+               "is_bot": int(bool(entity.bot)), "is_premium": int(bool(entity.premium)), "lang": entity.lang_code}
+        if entity.contact and not entity.is_self:
+            # у контактов аккаунта Telegram отдаёт имя из записной книжки — не берём вовсе
+            row.pop("first_name")
+            row.pop("last_name")
+        # имена и ники проверяет только бот; от Telethon — лишь чтобы заполнить пустое у нового человека
+        row["names_weak"] = True
+        return row
     if isinstance(entity, (tt.Channel, tt.Chat)):
         return {"id": tu.get_peer_id(entity), "kind": "channel", "first_name": entity.title,
                 "username": getattr(entity, "username", None) or _first_username(entity),
@@ -352,9 +359,11 @@ def from_ptb(m) -> dict | None:
 
 
 def ptb_user_row(user) -> dict:
+    """Пользователь из Bot API — публичные имя и ник (без правок из контактов), пишутся как есть."""
     return {"id": user.id, "kind": "user", "first_name": user.first_name, "last_name": user.last_name,
             "username": user.username, "is_bot": int(bool(user.is_bot)),
-            "is_premium": int(bool(getattr(user, "is_premium", False))), "lang": user.language_code}
+            "is_premium": int(bool(getattr(user, "is_premium", False))), "lang": user.language_code,
+            "names_exact": True, "name_src": "bot"}
 
 
 def ptb_chat_row(chat) -> dict:

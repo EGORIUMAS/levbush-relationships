@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 @dataclass
 class Episode:
     msgs: list = field(default_factory=list)
+    alias: dict = field(default_factory=dict)     # от имени группы/канала → человек
 
     @property
     def id(self) -> int:
@@ -33,18 +34,22 @@ class Episode:
     def participants(self) -> list[int]:
         seen = {}
         for m in self.msgs:
-            if not m["auto_fwd"] and m["sender_id"] is not None:
-                seen.setdefault(m["sender_id"], None)
+            a = _author(m, self.alias)
+            if a is not None:
+                seen.setdefault(a, None)
         return list(seen)
 
 
-def _author(m):
-    return None if m["auto_fwd"] else m["sender_id"]
+def _author(m, alias=None):
+    if m["auto_fwd"]:
+        return None
+    s = m["sender_id"]
+    return alias.get(s, s) if alias else s
 
 
-def _cast_splits(msgs, window: int) -> list[int]:
+def _cast_splits(msgs, window: int, alias=None) -> list[int]:
     """Индексы внутри куска без больших перерывов, где полностью сменился состав."""
-    authors = [_author(m) for m in msgs]
+    authors = [_author(m, alias) for m in msgs]
     n = len(msgs)
     splits = []
     last = 0
@@ -62,7 +67,7 @@ def _cast_splits(msgs, window: int) -> list[int]:
     return splits
 
 
-def segment(msgs, gap_min: int = 30, window: int = 15) -> list[Episode]:
+def segment(msgs, gap_min: int = 30, window: int = 15, alias: dict | None = None) -> list[Episode]:
     """msgs — строки сообщений без служебных, по возрастанию даты."""
     if not msgs:
         return []
@@ -76,9 +81,9 @@ def segment(msgs, gap_min: int = 30, window: int = 15) -> list[Episode]:
     runs.append(cur)
     out = []
     for run in runs:
-        cuts = [0] + _cast_splits(run, window) + [len(run)]
+        cuts = [0] + _cast_splits(run, window, alias) + [len(run)]
         for a, b in zip(cuts, cuts[1:]):
-            out.append(Episode(run[a:b]))
+            out.append(Episode(run[a:b], alias or {}))
     return out
 
 

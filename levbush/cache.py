@@ -79,6 +79,7 @@ create table if not exists users (
     photo_id    integer,
     is_member   integer,
     member_since integer,          -- дата входа по данным Telegram (participant.date)
+    name_src    text,              -- bot — имя/ник подтверждены ботом
     updated     integer
 );
 create index if not exists users_username on users(lower(username));
@@ -118,7 +119,7 @@ MSG_FIELDS = ("id", "date", "edit_date", "sender_id", "reply_to", "reply_peer", 
               "media_state", "grouped_id", "via_bot", "service", "service_data", "deleted", "source")
 
 USER_FIELDS = ("id", "kind", "first_name", "last_name", "username", "is_bot", "is_premium", "lang", "bio",
-               "avatar", "photo_id", "is_member", "member_since", "updated")
+               "avatar", "photo_id", "is_member", "member_since", "name_src", "updated")
 
 
 def _dump(value):
@@ -134,6 +135,9 @@ class Cache:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self.db.executescript(SCHEMA)   # сам управляет транзакцией
+        cols = {r[1] for r in self.db.execute("pragma table_info(users)")}
+        if "name_src" not in cols:      # кэш создан до появления колонки
+            self.db.execute("alter table users add column name_src text")
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -232,9 +236,20 @@ class Cache:
     def upsert_user(self, row: dict, db=None):
         db = db or self.db
         row = dict(row)
+        weak = row.pop("names_weak", False)       # имя из контактов: не затирает уже известное
+        exact = row.pop("names_exact", False)     # имя от бота (публичное): записывается как есть, даже пустое
         row.setdefault("updated", int(time.time()))
         cols = [k for k in USER_FIELDS if k in row]
-        updates = ", ".join(f"{k} = coalesce(excluded.{k}, {k})" for k in cols if k != "id")
+        names = ("first_name", "last_name", "username")
+
+        def upd(k):
+            if exact and k in names:
+                return f"{k} = excluded.{k}"
+            if weak and k in names:
+                return f"{k} = coalesce({k}, excluded.{k})"
+            return f"{k} = coalesce(excluded.{k}, {k})"
+
+        updates = ", ".join(upd(k) for k in cols if k != "id")
         db.execute(f"insert into users({', '.join(cols)}) values ({', '.join('?' for _ in cols)}) "
                    f"on conflict(id) do update set {updates}", [row[k] for k in cols])
 
@@ -244,6 +259,21 @@ class Cache:
     def user_by_username(self, username: str):
         return self.db.execute("select * from users where lower(username) = lower(?)",
                                (username.lstrip("@"),)).fetchone()
+
+    def aliases(self, spec: str) -> dict[int, int]:
+        """LEVBUSH_ALIASES «-100…=@ник,-100…=123» → {id группы/канала: id человека}."""
+        out = {}
+        for part in (spec or "").split(","):
+            if "=" not in part:
+                continue
+            src, dst = (x.strip() for x in part.split("=", 1))
+            if not src.lstrip("-").isdigit():
+                continue
+            if dst.lstrip("-").isdigit():
+                out[int(src)] = int(dst)
+            elif (u := self.user_by_username(dst)) is not None:
+                out[int(src)] = u["id"]
+        return out
 
     def add_membership(self, uid: int, date: int, event: str, source: str, db=None):
         (db or self.db).execute("insert or ignore into membership(user_id, date, event, source) values (?, ?, ?, ?)",

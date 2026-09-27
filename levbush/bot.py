@@ -228,7 +228,10 @@ class Levbush:
                 pass
 
         await self.tg.sync_participants()
+        await self.tg.forget_contact_names()
+        await self.refresh_names()
         n = await self.tg.sync_history(progress=progress)
+        await self.refresh_names()                 # авторы старых сообщений появились только теперь
         self.dirty = True
         await self.push_stats(force=True)
         if first and msg:
@@ -283,10 +286,34 @@ class Levbush:
             except Exception:  # noqa: BLE001
                 log.exception("медиа")
 
+    async def refresh_names(self) -> int:
+        """Имена и ники — от бота (getChatMember): у Telethon для контактов имена из записной книжки."""
+        ids = [r[0] for r in self.cache.db.execute(
+            """select id from users u where kind = 'user' and not is_bot and (is_member = 1
+               or exists (select 1 from messages m where m.sender_id = u.id)
+               or exists (select 1 from reactions r where r.user_id = u.id))""")]
+        n = 0
+        for uid in ids:
+            try:
+                cm = await self.app.bot.get_chat_member(self.chat_id, uid)
+            except TelegramError:
+                continue                           # никогда не был в группе / удалён — остаётся имя от Telethon
+            before = self.cache.user(uid)
+            self.cache.upsert_user(ptb_user_row(cm.user))
+            after = self.cache.user(uid)
+            if any(before[k] != after[k] for k in ("first_name", "last_name", "username")):
+                n += 1
+            await asyncio.sleep(0.1)
+        if n:
+            self.dirty = True
+        log.info("имена от бота: сменилось %d из %d", n, len(ids))
+        return n
+
     async def job_participants(self, ctx):
         if self.tg_ok and self.initiated and not self.busy("синхронизация"):
             try:
                 await self.tg.sync_participants()
+                await self.refresh_names()
                 self.dirty = True
             except Exception:  # noqa: BLE001
                 log.exception("участники")
@@ -300,7 +327,11 @@ class Levbush:
             await self.tg.sync_history()
             await self.tg.refresh_reactions(int(time.time()) - 3 * 86400)
             await self.tg.sync_participants()
-            await self.tg.sync_profiles()
+            await self.tg.forget_contact_names()
+            changed = await self.refresh_names()          # имена и ники — только от бота
+            prof = await self.tg.sync_profiles()           # аватарки и био — раз в сутки на человека
+            log.info("ежедневная проверка профилей: сменилось имён/ников %d, аватарок %d, био %d",
+                     changed, prof["avatars"], prof["bios"])
             while await self.tg.download_pending(limit=500):
                 pass
         self.dirty = True

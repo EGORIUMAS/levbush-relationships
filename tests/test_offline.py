@@ -312,3 +312,47 @@ def test_tg_pacing(env, monkeypatch):
     assert len(calls) == 2 and tg.floods == 1 and tg.slow == 2.0
     assert any(s >= 30 * 1.1 for s in slept)                      # ждали FloodWait с запасом
     assert slept[-1] >= cfg.tg_reaction_delay * 2 * 0.9           # и дальше идём в два раза медленнее
+
+
+def test_alias_bots_contact_names(tmp_path):
+    cfg = Config()
+    cfg.data_dir = tmp_path
+    cfg.aliases = f"{CHAT}=@levbush"
+    cache = Cache(tmp_path / "c.db")
+    cache.set("chat", {"id": CHAT, "title": "Т", "channel_id": CHANNEL})
+    LEV, BOT = 501, 502
+    cache.upsert_user({"id": LEV, "first_name": "Лев", "username": "levbush", "is_member": 1})
+    cache.upsert_user({"id": BOT, "first_name": "Модератор", "is_bot": 1, "is_member": 1})
+    cache.upsert_user({"id": A, "first_name": "Аня", "is_member": 1})
+    t0 = NOW - 86400
+    with cache.tx() as db:
+        for m in (dict(id=1, date=t0, sender_id=CHAT, text="пишу от имени группы"),
+                  dict(id=2, date=t0 + 60, sender_id=A, text="ответ Льву", reply_to=1),
+                  dict(id=3, date=t0 + 120, sender_id=BOT, text="я бот"),
+                  dict(id=4, date=t0 + 180, sender_id=A, text="ответ боту", reply_to=3)):
+            cache.upsert_message(m, db)
+    cache.set_reactions(3, [(A, "👍", t0 + 200)])
+    res = S.compute(cache, cfg, now=NOW)
+    assert res.totals[LEV]["c"]["msgs"] == 1 and res.totals[LEV]["c"]["replies_recv"] == 1
+    assert res.pairs[(A, LEV)]["replies"] == 1
+    assert BOT not in res.totals and BOT not in res.people and (A, BOT) not in res.pairs
+    assert res.totals[A]["c"]["replies"] == 1 and "reactions_recv" not in res.totals[A]["c"]
+    assert res.group["members"] == 2 and res.group["messages"] == 3
+    an = Analyzer(cfg, cache, db=None, mgr=None)
+    assert an._persons(an.load_messages()) == [LEV, A]
+    assert "Лев (@levbush) [пишет от имени группы] (id 501)" in an.r.line(cache.message(1))
+    # имена: от Telethon — никогда для контактов и никогда поверх известного; бот пишет как есть
+    from telegram import User as BotUser
+    from levbush.normalize import ptb_user_row, tt_user_row
+    from telethon.tl import types as t
+    cache.upsert_user(tt_user_row(t.User(id=LEV, first_name="Лев F & P", contact=True)))
+    assert cache.user(LEV)["first_name"] == "Лев"
+    cache.upsert_user(tt_user_row(t.User(id=777, first_name="Контакт", username="real", contact=True)))
+    assert cache.user(777)["first_name"] is None and cache.user(777)["username"] == "real"
+    cache.upsert_user(tt_user_row(t.User(id=A, first_name="Другое имя")))
+    assert cache.user(A)["first_name"] == "Аня"
+    cache.upsert_user(ptb_user_row(BotUser(LEV, "Лев", False, last_name=None, username="levbush")))
+    cache.upsert_user({"id": LEV, "last_name": "F & P"})          # что-то записало фамилию…
+    cache.upsert_user(ptb_user_row(BotUser(LEV, "Лев", False)))    # …бот стирает: у профиля её нет
+    u = cache.user(LEV)
+    assert u["last_name"] is None and u["name_src"] == "bot"

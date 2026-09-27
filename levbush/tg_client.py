@@ -442,30 +442,56 @@ class TG:
             self.cache.set("participants_synced", now)
             return len(present)
 
-    async def sync_profiles(self, max_age_days: int = 7):
-        """Био и аватарки: участники и все, кто писал. Раз в max_age_days на человека."""
+    async def forget_contact_names(self) -> int:
+        """Стирает имена, пришедшие из записной книжки аккаунта (у контактов, которых бот ещё не подтвердил).
+        Берётся только список id контактов — один запрос; сами имена через Telethon не проверяются."""
+        res = await self.req("misc", self.client, functions.contacts.GetContactsRequest(hash=0))
+        ids = [u.id for u in getattr(res, "users", [])]
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        cur = self.cache.db.execute(
+            f"""update users set first_name = null, last_name = null
+                where id in ({marks}) and coalesce(name_src, '') <> 'bot' and first_name is not null""", ids)
+        log.info("имена из контактов стёрты у %d", cur.rowcount)
+        return cur.rowcount
+
+    async def sync_profiles(self, max_age_hours: float = 20) -> dict:
+        """Аватарки и био: участники и все, кто писал или реагировал; каждый не чаще раза в max_age_hours.
+        Фото — настоящее фото профиля (full_user.profile_photo), а не личное, поставленное контакту на аккаунте.
+        Качается, только если id фото сменился; удалённая аватарка снимается. Имена/ники тут не трогаем — их берёт бот."""
+        stat = {"checked": 0, "avatars": 0, "bios": 0}
         async with self.io_lock:
-            limit = int(time.time()) - max_age_days * 86400
+            limit = int(time.time() - max_age_hours * 3600)
             rows = self.cache.db.execute(
-                "select u.id, u.photo_id, u.kind from users u where (u.is_member = 1 or exists "
-                "(select 1 from messages m where m.sender_id = u.id)) and coalesce(cast(json_extract("
-                "(select value from kv where key = 'profile:' || u.id), '$') as integer), 0) < ?", (limit,)).fetchall()
-            for uid, photo_id, kind in rows:
+                """select u.id, u.photo_id, u.avatar, u.bio from users u where u.kind = 'user' and not u.is_bot
+                   and (u.is_member = 1 or exists (select 1 from messages m where m.sender_id = u.id)
+                        or exists (select 1 from reactions r where r.user_id = u.id))
+                   and coalesce(cast(json_extract((select value from kv where key = 'profile:' || u.id), '$')
+                                as integer), 0) < ?""", (limit,)).fetchall()
+            for uid, old_photo, old_avatar, old_bio in rows:
                 try:
                     entity = await self.req("profile", self.client.get_entity, uid)
-                    row = tt_user_row(entity)
-                    if kind == "user" and isinstance(entity, tt.User):
-                        full = await self.req("profile", self.client, functions.users.GetFullUserRequest(entity))
-                        row["bio"] = full.full_user.about
-                    if entity.photo and not isinstance(entity.photo, (tt.UserProfilePhotoEmpty, tt.ChatPhotoEmpty)):
-                        raw = await self.req("profile", self.client.download_profile_photo, entity, file=bytes,
-                                             download_big=False)
-                        if raw:
-                            row["avatar"] = avatar_data_uri(raw)
+                    full = (await self.req("profile", self.client, functions.users.GetFullUserRequest(entity))).full_user
+                    row = {"id": uid, "bio": full.about or ""}
+                    photo = full.profile_photo if isinstance(full.profile_photo, tt.Photo) else None
+                    if photo is None:
+                        if old_avatar:
+                            row.update(avatar="", photo_id=0)         # аватарку удалили
+                            stat["avatars"] += 1
+                    elif photo.id != old_photo or not old_avatar:
+                        raw = await self.req("profile", self.client.download_media, photo, file=bytes, thumb=-1)
+                        if raw and (uri := avatar_data_uri(raw)):
+                            row.update(avatar=uri, photo_id=photo.id)
+                            stat["avatars"] += 1
+                    stat["bios"] += (full.about or "") != (old_bio or "")
                     self.cache.upsert_user(row)
+                    stat["checked"] += 1
                 except (errors.RPCError, ValueError) as exc:
                     log.info("профиль %s: %s", uid, exc)
                 self.cache.set(f"profile:{uid}", int(time.time()))
+        log.info("профили: %s", stat)
+        return stat
 
     # ------------------------------------------------------------ медиа
 

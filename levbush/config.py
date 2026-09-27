@@ -62,6 +62,8 @@ class Config:
     api_hash: str = field(default_factory=lambda: env("API_HASH", ""))
     database_url: str = field(default_factory=lambda: env("DATABASE_URL", ""))
     webapp_url: str = field(default_factory=lambda: env("WEBAPP_URL", ""))
+    # чьи сообщения от имени группы/канала: "-100…=@ник,-100…=@ник" (аноним-админ, пост от канала)
+    aliases: str = field(default_factory=lambda: env("ALIASES", ""))
     webapp_name: str = field(default_factory=lambda: env("WEBAPP_NAME", ""))       # короткое имя Mini App (/newapp)
     tz: ZoneInfo = field(default_factory=lambda: ZoneInfo(env("TZ", "Europe/Moscow")))
 

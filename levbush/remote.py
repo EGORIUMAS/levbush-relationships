@@ -142,6 +142,19 @@ class DB:
                                strength = case when relations.llm_score is null then excluded.quant
                                                else 0.4 * excluded.quant + 0.6 * relations.llm_score end""",
                         [(k[0], k[1], r["quant"], r["co_episodes"]) for k, r in rels])
+                # чего больше нет в пересчёте (боты, исключённые): удалить; связи с описанием нейросети — оставить
+                await conn.execute("delete from people where not (id = any($1::bigint[]))", list(res.people))
+                await conn.execute("delete from stats_total where not (user_id = any($1::bigint[]))", list(res.totals))
+                await conn.execute("delete from stats_period where not (user_id = any($1::bigint[]))", list(res.totals))
+                srcs, dsts = zip(*res.pairs) if res.pairs else ((), ())
+                await conn.execute(
+                    """delete from pair_stats p where not exists (select 1 from unnest($1::bigint[], $2::bigint[]) u(s, d)
+                       where u.s = p.src and u.d = p.dst)""", list(srcs), list(dsts))
+                ra, rb = zip(*res.relations) if res.relations else ((), ())
+                await conn.execute(
+                    """delete from relations r where r.llm_score is null and r.description is null and not exists
+                       (select 1 from unnest($1::bigint[], $2::bigint[]) u(a, b) where u.a = r.a and u.b = r.b)""",
+                    list(ra), list(rb))
                 # старые периоды
                 today = datetime.fromtimestamp(res.computed_at, cfg.tz).date()
                 cd, cw, cm = retention_cutoffs(today, cfg)
@@ -167,6 +180,10 @@ class DB:
         except BaseException:
             self._hashes = {}   # не знаем, что дошло, — в следующий раз отправим всё
             raise
+        live = ({f"people:{k}" for k in res.people} | {f"total:{k}" for k in res.totals}
+                | {f"period:{k[0]}:{k[1]}:{k[2]}" for k in res.periods} | {f"pair:{k[0]}:{k[1]}" for k in res.pairs}
+                | {f"rel:{k[0]}:{k[1]}" for k in res.relations})
+        self._hashes = {k: v for k, v in self._hashes.items() if k in live or k.startswith("daily:")}
         self._save_hashes()
         sent.update(people=len(people), totals=len(totals), periods=len(periods), pairs=len(pairs), relations=len(rels))
         return sent

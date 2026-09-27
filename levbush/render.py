@@ -53,6 +53,12 @@ class Renderer:
         self.cache, self.cfg = cache, cfg
         self.chat = cache.get("chat", {}) or {}
         self._names = {}
+        self.alias = cache.aliases(cfg.aliases)
+
+    def sender(self, m):
+        """Автор с учётом псевдонимов: сообщение от имени группы/канала → конкретный человек."""
+        s = m["sender_id"]
+        return self.alias.get(s, s) if not m["auto_fwd"] else s
 
     def name(self, uid) -> str:
         if uid is None:
@@ -82,7 +88,7 @@ class Renderer:
             body = f"[{MEDIA_RU.get(m['media'], m['media'])}]"
         if len(body) > limit:
             body = body[:limit] + "…"
-        return f"#{msg_id} {self.name(m['sender_id']).split(' (@')[0]}: «{body}»"
+        return f"#{msg_id} {self.name(self.sender(m)).split(' (@')[0]}: «{body}»"
 
     def reactions(self, msg_id: int) -> str:
         rows = self.cache.db.execute("select user_id, emoji from reactions where msg_id = ?", (msg_id,)).fetchall()
@@ -131,8 +137,11 @@ class Renderer:
 
     def line(self, m, with_ids: bool = True) -> str:
         dt = datetime.fromtimestamp(m["date"], self.cfg.tz).strftime("%Y-%m-%d %H:%M")
-        who = self.name(m["sender_id"])
-        head = f"[#{m['id']} {dt}] {who}" + (f" (id {m['sender_id']})" if with_ids and m["sender_id"] else "")
+        uid = self.sender(m)
+        who = self.name(uid)
+        if uid != m["sender_id"]:
+            who += " [пишет от имени " + ("канала]" if m["sender_id"] == self.chat.get("channel_id") else "группы]")
+        head = f"[#{m['id']} {dt}] {who}" + (f" (id {uid})" if with_ids and uid else "")
         if m["auto_fwd"]:
             head += " — пост канала"
         extra = []

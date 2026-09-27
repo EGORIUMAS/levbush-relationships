@@ -123,10 +123,12 @@ def compute(cache: Cache, cfg: Config, now: int | None = None) -> Result:
     res = Result(computed_at=now)
     chat = cache.get("chat", {}) or {}
     chat_id, channel_id = chat.get("id"), chat.get("channel_id")
-    hidden_ids = {x for x in (chat_id, channel_id) if x}
-
     db = cache.db
     users = {r["id"]: dict(r) for r in db.execute("select * from users")}
+    bot_ids = {uid for uid, u in users.items() if u.get("is_bot")}
+    alias = cache.aliases(cfg.aliases)          # от имени группы/канала → конкретный человек
+    # не люди: сама группа (аноним-админ без псевдонима), привязанный канал, боты — в статистику не идут
+    hidden_ids = {x for x in (chat_id, channel_id) if x} | bot_ids
     by_username = {u["username"].lower(): uid for uid, u in users.items() if u.get("username")}
 
     today = datetime.fromtimestamp(now, tz).date()
@@ -166,6 +168,8 @@ def compute(cache: Cache, cfg: Config, now: int | None = None) -> Result:
 
     for r in msgs:
         mid, ts, s = r["id"], r["date"], r["sender_id"]
+        if not r["auto_fwd"] and s in alias:
+            s = alias[s]
         sender_of[mid] = s
         date_of[mid] = ts
         if r["service"]:
@@ -273,14 +277,14 @@ def compute(cache: Cache, cfg: Config, now: int | None = None) -> Result:
             _inc(pairs, (uid, target), "reactions")
 
     # эпизоды: начатые беседы и совместное участие
-    episodes = segment(content, cfg.gap_min, cfg.cast_window)
+    episodes = segment(content, cfg.gap_min, cfg.cast_window, alias)
     started = Counter()
     co = Counter()
     for ep in episodes:
         parts = [p for p in ep.participants if p not in hidden_ids]
         if not parts:
             continue
-        first_author = next((m["sender_id"] for m in ep.msgs if not m["auto_fwd"]), None)
+        first_author = next((alias.get(m["sender_id"], m["sender_id"]) for m in ep.msgs if not m["auto_fwd"]), None)
         if first_author is not None and len(parts) > 1:
             started[first_author] += 1
         if len(parts) <= 40:
@@ -293,7 +297,8 @@ def compute(cache: Cache, cfg: Config, now: int | None = None) -> Result:
     for uid, ts, ev in db.execute("select user_id, date, event from membership"):
         membership[uid].append((ts, ev))
     ids = set(totals) | {uid for uid, u in users.items() if u.get("is_member")} | set(membership)
-    ids |= hidden_ids & set(users)
+    ids |= {x for x in (chat_id, channel_id) if x} & set(users)
+    ids -= bot_ids
 
     for uid in ids:
         u = users.get(uid, {"id": uid, "kind": "user"})
@@ -361,10 +366,11 @@ def compute(cache: Cache, cfg: Config, now: int | None = None) -> Result:
         res.relations[key] = {"quant": round(math.log1p(w) / math.log1p(top), 4) if top else 0.0,
                               "co_episodes": co.get(key, 0), "weight": round(w, 2)}
 
-    members = sum(1 for p in res.people.values() if p["is_member"] and p["kind"] == "user" and not p["hidden"])
+    members = sum(1 for p in res.people.values()
+                  if p["is_member"] and p["kind"] == "user" and not p["hidden"] and not p["is_bot"])
     res.group = {"chat_id": chat_id, "title": chat.get("title"), "username": chat.get("username"),
                  "channel_id": channel_id, "channel_title": chat.get("channel_title"), "members": members,
-                 "messages": sum(1 for r in content if not r["auto_fwd"]), "first_date": group_first,
+                 "messages": sum(t["c"].get("msgs", 0) for t in res.totals.values()), "first_date": group_first,
                  "tz": str(cfg.tz)}
     res.daily = {d: (daily_msgs[d], len(daily_users[d])) for d in daily_msgs}
     return res

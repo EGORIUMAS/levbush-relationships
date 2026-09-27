@@ -172,8 +172,9 @@ class Analyzer:
     def _persons(self, msgs) -> list[int]:
         seen = {}
         for m in msgs:
-            if not m["auto_fwd"] and self._is_person(m["sender_id"]):
-                seen.setdefault(m["sender_id"], None)
+            s = self.r.sender(m)
+            if not m["auto_fwd"] and self._is_person(s):
+                seen.setdefault(s, None)
         return list(seen)
 
     def _text(self, e: Episode) -> str:
@@ -196,7 +197,7 @@ class Analyzer:
         """Все окна истории: эпизоды, слишком длинные разрезаны по бюджету шага."""
         out = []
         limit = self.cfg.step_tokens
-        for e in segment(msgs, self.cfg.gap_min, self.cfg.cast_window):
+        for e in segment(msgs, self.cfg.gap_min, self.cfg.cast_window, self.r.alias):
             if self._tokens(e) <= limit:
                 out.append(e)
                 continue
@@ -204,12 +205,12 @@ class Analyzer:
             for m in e.msgs:
                 n = self._msg_tokens(m)
                 if cur and size + n > limit * 0.8:
-                    out.append(Episode(cur))
+                    out.append(Episode(cur, self.r.alias))
                     cur, size = [], 0
                 cur.append(m)
                 size += n
             if cur:
-                out.append(Episode(cur))
+                out.append(Episode(cur, self.r.alias))
         return out
 
     def _done(self) -> dict:
@@ -280,7 +281,7 @@ class Analyzer:
                    if (u := self.cache.user(uid)) is not None and u["username"]}
         count = defaultdict(int)
         for m in msgs:
-            s = m["sender_id"]
+            s = self.r.sender(m)
             if s not in people:
                 continue
             count[s] += 1
@@ -288,7 +289,7 @@ class Analyzer:
             if m["reply_to"]:
                 t = self.cache.message(m["reply_to"])
                 if t is not None:
-                    targets.add(t["sender_id"])
+                    targets.add(self.r.sender(t))
             for e in json.loads(m["entities"]) if m["entities"] else []:
                 if e.get("t") == "text_mention":
                     targets.add(e.get("u"))
