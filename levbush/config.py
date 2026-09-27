@@ -105,6 +105,7 @@ class Config:
     step_context_chars: int = field(default_factory=lambda: env_int("STEP_CONTEXT_CHARS", 30000))  # уже разобранные
     step_relations_chars: int = field(default_factory=lambda: env_int("STEP_RELATIONS_CHARS", 30000))
     step_max_windows: int = field(default_factory=lambda: env_int("STEP_MAX_WINDOWS", 8))
+    step_max_discussed: int = field(default_factory=lambda: env_int("STEP_MAX_DISCUSSED", 6))  # обсуждаемые заочно — с досье
     step_max_people: int = field(default_factory=lambda: env_int("STEP_MAX_PEOPLE", 10))
     # медиа в запросе: лимиты (= --limit-mm-per-prompt сервера) и оценка токенов для планирования
     mm_images: int = field(default_factory=lambda: env_int("MM_IMAGES", 24))

@@ -168,8 +168,10 @@ class FakeLLM:
         self.calls.append((messages, schema, kw))
         return {"windows": [{"id": 1, "summary": "знакомство", "topics": ["привет"], "mood": "тепло"}],
                 "add": [{"person": A, "section": "facts", "text": "живёт в Саратове", "msgs": [2], "certain": True},
-                        {"person": 999, "section": "facts", "text": "чужой", "msgs": [], "certain": True}],
-                "update": [], "remove": [],
+                        {"person": 999, "section": "facts", "text": "чужой", "msgs": [], "certain": True},
+                        {"person": D, "section": "facts", "text": "со слов Ани: уехал на море", "msgs": [2],
+                         "certain": False}],
+                "update": [{"person": D, "entry": "e1", "text": "нельзя", "msgs": [], "why": ""}], "remove": [],
                 "summaries": [{"person": A, "text": "активная участница"}],
                 "relations": [{"a": A, "b": B, "kind": "дружба", "tone": "тёплый", "closeness": 7,
                                "summary": "друзья"}],
@@ -185,6 +187,9 @@ class FakeDB:
         return {}
 
     async def dossier(self, uid):
+        return None
+
+    async def relation(self, a, b):
         return None
 
     async def call(self, fn, *a):
@@ -222,8 +227,12 @@ def test_step(env):
     assert "## Новые окна переписки" in text and "Досье пока нет" in text and "Верни только ПРАВКИ" in text
     assert kw["audio_in_video"] is True and "add" in schema["properties"]
     kinds = [x[0] for x in db.saved]
-    assert kinds.count("dossier") == 1 and kinds.count("relation") == 1 and ("episode", 1) in db.saved
-    _, uid, md, data, summary = next(x for x in db.saved if x[0] == "dossier")
+    assert kinds.count("dossier") == 2 and kinds.count("relation") == 1 and ("episode", 1) in db.saved
+    assert "## Остальные люди группы" in text and "Гоша (@gosha), id 104" in text
+    absent = next(x for x in db.saved if x[0] == "dossier" and x[1] == D)
+    assert [e["text"] for e in absent[3]["entries"]] == ["со слов Ани: уехал на море"]
+    assert absent[3]["entries"][0]["certain"] is False
+    _, uid, md, data, summary = next(x for x in db.saved if x[0] == "dossier" and x[1] == A)
     base_day = datetime.fromtimestamp(NOW - 5 * 86400 + 60, cfg.tz).strftime("%Y-%m-%d")
     assert uid == A and summary == "активная участница"
     assert data["entries"][0]["since"] == base_day                 # дата — по сообщению #2
@@ -356,3 +365,13 @@ def test_alias_bots_contact_names(tmp_path):
     cache.upsert_user(ptb_user_row(BotUser(LEV, "Лев", False)))    # …бот стирает: у профиля её нет
     u = cache.user(LEV)
     assert u["last_name"] is None and u["name_src"] == "bot"
+
+
+def test_discussed(env):
+    cfg, cache = env
+    an = Analyzer(cfg, cache, db=None, mgr=None)
+    base = {"auto_fwd": 0, "reply_peer": None, "fwd_from_id": None, "entities": None, "reply_to": None}
+    msgs = [dict(base, id=900, sender_id=A, text="помнишь, что Гоша писал?", reply_to=8),         # ответ на старое D
+            dict(base, id=901, sender_id=B, text="@anya и @gosha", entities=json.dumps(
+                [{"t": "mention", "o": 0, "l": 5}, {"t": "mention", "o": 8, "l": 6}]))]
+    assert an._discussed(msgs, {A, B}) == [D]          # A пишет сама — не «обсуждаемая»; D — дважды

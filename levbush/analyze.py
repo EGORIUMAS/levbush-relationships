@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -354,14 +354,52 @@ class Analyzer:
             out.append(text)
         return "\n\n".join(out)
 
+    def _discussed(self, msgs, writers: set) -> list[int]:
+        """Кого в окнах явно затронули, хотя сам он там не писал: @упоминание/ссылка на профиль, ответ или цитата
+        на его старое сообщение, пересылка его сообщения. По частоте."""
+        from .normalize import u16_slice
+        hits = Counter()
+        for m in msgs:
+            for e in json.loads(m["entities"]) if m["entities"] else []:
+                if e.get("t") == "text_mention" and e.get("u"):
+                    hits[e["u"]] += 1
+                elif e.get("t") == "mention":
+                    u = self.cache.user_by_username(u16_slice(m["text"], e["o"], e["l"]).lstrip("@"))
+                    if u is not None:
+                        hits[u["id"]] += 1
+            if m["reply_to"] and not m["reply_peer"]:
+                t = self.cache.message(m["reply_to"])
+                if t is not None:
+                    hits[self.r.sender(t)] += 1
+            if m["fwd_from_id"] and not m["auto_fwd"]:
+                hits[m["fwd_from_id"]] += 1
+        return [uid for uid, _ in hits.most_common()
+                if uid not in writers and self._is_person(uid) and self.cache.user(uid) is not None]
+
+    async def _roster(self, exclude: set) -> tuple[list[int], str]:
+        """Все остальные люди группы одной строкой каждый — чтобы Nemotron мог записать то, что о них сказали заочно."""
+        ids = [r[0] for r in self.cache.db.execute(
+            """select id from users u where kind = 'user' and not is_bot and (is_member = 1
+               or exists (select 1 from messages m where m.sender_id = u.id))""") if r[0] not in exclude]
+        ids = [uid for uid in ids if self._is_person(uid)]
+        briefs = await self.db.people_brief(ids) if ids else {}
+        lines = []
+        for uid in ids:
+            s = (briefs.get(uid) or {}).get("summary")
+            lines.append(f"- {self.r.name(uid)}, id {uid}" + (f" — {s}" if s else ""))
+        return ids, "\n".join(lines)
+
     async def step(self, wins: list[Episode], first: int, last: int, now: int):
         new = wins[first:last]
         msgs = [m for w in new for m in w.msgs]
-        people = sorted({p for w in new for p in self._persons(w.msgs)})
-        if not people:
+        writers = sorted({p for w in new for p in self._persons(w.msgs)})
+        if not writers:
             for w in new:
                 self._mark(w, "done")
             return
+        discussed = self._discussed(msgs, set(writers))[:self.cfg.step_max_discussed]
+        people = writers + discussed               # у них полные досье: можно add / update / remove
+        roster_ids, roster = await self._roster(set(people))   # остальные: только add и события связей
         as_of_ts = new[-1].end
         with_stats = now - as_of_ts < 3 * 86400
         active = self._interactions(msgs, set(people))
@@ -379,7 +417,11 @@ class Analyzer:
             "Ниже текущие досье и связи, затем новые окна переписки. Разбери окна и внеси в досье и связи правки.",
             RULES,
             "## Участники новых окон и их текущие досье (в квадратных скобках — id записей)\n\n"
-            + await self._people_block(people, with_stats, dossiers),
+            + await self._people_block(writers, with_stats, dossiers),
+            ("## Кого в новых окнах обсуждают, хотя сами они там не пишут (упоминания, ответы на их старые "
+             "сообщения), — их досье\n\n" + await self._people_block(discussed, with_stats, dossiers))
+            if discussed else "",
+            ("## Остальные люди группы (досье не показаны)\n" + roster) if roster else "",
             "## Текущие связи между ними\n\n" + (self._relations_block(rel_rows, active) or "Пока не описаны."),
             ("## Контекст: переписка перед новыми окнами (уже разобрана — только для понимания)\n\n" + context)
             if context else "",
@@ -399,6 +441,11 @@ class Analyzer:
             "- update — запись изменилась или уточнилась: entry — её id (e12), text — новый текст, why — что "
             "произошло (например «переехал»). Старый текст и дата изменения сохранятся сами.\n"
             "- remove — запись устарела или оказалась неверной (entry, why). Она останется в досье зачёркнутой.\n"
+            "- О людях, которых обсуждают заочно (в том числе из списка «Остальные люди группы» — по имени, "
+            "прозвищу, намёку), тоже добавляй записи (add) и события связей. Сказанное о человеке другими помечай "
+            "в тексте — «со слов Ани: …» — и ставь certain=false, пока сам человек этого не подтвердил. "
+            "update и remove — только для записей, показанных в досье выше; summaries — только для людей с "
+            "показанным досье.\n"
             "- summaries — одна строка до 140 знаков «кто это в группе», если прежней нет или она устарела.\n"
             "- relations — для пар (a < b), чья связь проявилась в новых окнах и у которых что-то новое: kind "
             "(дружба, флирт, пара, соперничество, коллеги, перепалки, знакомые…), tone, closeness 0–10 (сила и "
@@ -432,8 +479,8 @@ class Analyzer:
                 raise
         log.info("шаг #%s: оценка %d ток., медиа %d ток., не влезло вложений %d", new[0].id, est, media_tokens,
                  len(budget.dropped))
-        await self._apply(out, new, set(people), datetime.fromtimestamp(as_of_ts, timezone.utc), dossiers,
-                          {(r["a"], r["b"]): r for r in rel_rows})
+        await self._apply(out, new, set(people), set(roster_ids), datetime.fromtimestamp(as_of_ts, timezone.utc),
+                          dossiers, {(r["a"], r["b"]): r for r in rel_rows})
         for w in new:
             self._mark(w, "done")
 
@@ -445,7 +492,9 @@ class Analyzer:
             return when.strftime("%Y-%m-%d")
         return day
 
-    async def _apply(self, out: dict, new: list[Episode], people: set, as_of: datetime, dossiers: dict, rels: dict):
+    async def _apply(self, out: dict, new: list[Episode], people: set, roster: set, as_of: datetime, dossiers: dict,
+                     rels: dict):
+        """people — с показанным досье (любые правки); roster — остальные (только add и события/заметки связей)."""
         by_id = {w.id: w for w in new}
         for item in out.get("windows", []):
             w = by_id.get(item.get("id"))
@@ -460,11 +509,23 @@ class Analyzer:
             if apply_person(data, out, uid, day):
                 await self.db.save_dossier(uid, as_of, data.get("summary") or None, render_person(data, self.chat), data)
                 self.stat["dossiers"] += 1
+        # заочно обсуждаемые из общего списка: только новые записи
+        only_add = {"add": out.get("add", [])}
+        for uid in sorted({o.get("person") for o in out.get("add", [])} & roster):
+            row = await self.db.dossier(uid)
+            data = row["data"] if row and row["data"].get("entries") is not None else empty_dossier()
+            if apply_person(data, only_add, uid, day):
+                await self.db.save_dossier(uid, as_of, data.get("summary") or None, render_person(data, self.chat), data)
+                self.stat["dossiers"] += 1
+        allowed = people | roster
         touched = {(min(o["a"], o["b"]), max(o["a"], o["b"]))
                    for key in ("relations", "relation_events", "relation_notes") for o in out.get(key, [])
-                   if o.get("a") in people and o.get("b") in people and o.get("a") != o.get("b")}
+                   if o.get("a") in allowed and o.get("b") in allowed and o.get("a") != o.get("b")}
         fields = {(min(o["a"], o["b"]), max(o["a"], o["b"])): o for o in out.get("relations", [])}
         for a, b in sorted(touched):
+            if (a, b) not in rels:
+                r = await self.db.relation(a, b)
+                rels[(a, b)] = dict(r) if r else {}
             row = rels.get((a, b)) or {}
             data = row["data"] if row.get("data") and "events" in row["data"] else empty_relation()
             n = apply_relation(data, out, a, b, day)
