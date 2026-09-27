@@ -1044,7 +1044,9 @@
     if (t.conversations_started != null) add('Начал(а) бесед', fmtN(t.conversations_started));
     let html = rows.length ? `<dl class="facts">${rows.join('')}</dl>` : '<p class="empty">Нет данных.</p>';
     const tr = Array.isArray(t.top_reactions) ? t.top_reactions.filter((x) => Array.isArray(x)) : [];
-    if (tr.length) html += `<h4>Любимые реакции</h4><div class="reactions">${tr.slice(0, 12).map(([e, n]) => `<span class="reaction">${esc(e)}<span>${fmtN(n)}</span></span>`).join('')}</div>`;
+    // премиум-реакция: [custom:ID, n, аналог] — на сайте показываем обычный эмодзи-аналог
+    const rLabel = (e, alt) => (String(e).startsWith('custom:') || e === 'paid' ? (alt || '⭐') : e);
+    if (tr.length) html += `<h4>Любимые реакции</h4><div class="reactions">${tr.slice(0, 12).map(([e, n, alt]) => `<span class="reaction"${String(e).startsWith('custom:') ? ' title="Премиум-реакция"' : ''}>${esc(rLabel(e, alt))}<span>${fmtN(n)}</span></span>`).join('')}</div>`;
     return html;
   }
 
