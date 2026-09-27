@@ -344,7 +344,9 @@ def compute(cache: Cache, cfg: Config, now: int | None = None) -> Result:
             "active_min_per_day": round(sum(durations) / 60 / len(adays), 1) if adays else None,
             "median_reply_sec": int(statistics.median(reply_lat[uid])) if reply_lat.get(uid) else None,
             "conversations_started": started.get(uid, 0),
-            "top_reactions": top_reactions[uid].most_common(5) if uid in top_reactions else [],
+            # [реакция, сколько, эмодзи-аналог] — у премиум-реакций (custom:ID) аналог для сайта и нейросети
+            "top_reactions": [[e, n, cache.reaction_label(e)] for e, n in top_reactions[uid].most_common(5)]
+            if uid in top_reactions else [],
         }
         res.totals[uid] = {"c": dict(c), "extra": extra}
 

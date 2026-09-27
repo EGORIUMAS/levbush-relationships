@@ -257,6 +257,7 @@ class Levbush:
         if not (self.dirty or force):
             return
         self.dirty = False
+        await self.resolve_custom_emoji()
         res = await asyncio.to_thread(S.compute, self.cache, self.cfg)
         sent = await self.db.push_stats(res, self.cfg)
         self.last_stats = time.time()
@@ -496,12 +497,36 @@ class Levbush:
             if t.get("active_days"):
                 facts.append(f"активных дней {t['active_days']}, лучшая серия {t.get('longest_streak')} дн., "
                              f"начал бесед {t.get('conversations_started', 0)}")
-            if t.get("top_reactions"):
-                facts.append("любимые реакции: " + " ".join(f"{e if not e.startswith('custom:') else '★'}×{n}"
-                                                           for e, n in t["top_reactions"]))
             lines.append("")
             lines += [f"• {esc(f)}" for f in facts]
+            if t.get("top_reactions"):
+                lines.append("• любимые реакции: " + " ".join(f"{self.reaction_html(*r)}×{r[1]}"
+                                                             for r in t["top_reactions"]))
         return "\n".join(lines)
+
+    @staticmethod
+    def reaction_html(key: str, n=None, alt: str | None = None) -> str:
+        """Премиум-реакция — настоящим кастомным эмодзи (tg-emoji), с обычным аналогом на случай, если не покажется."""
+        if key.startswith("custom:"):
+            return f'<tg-emoji emoji-id="{key[7:]}">{esc(alt or "⭐")}</tg-emoji>'
+        return "⭐" if key == "paid" else esc(key)
+
+    async def resolve_custom_emoji(self):
+        """Узнаёт у Telegram обычные эмодзи-аналоги премиум-реакций (getCustomEmojiStickers, до 200 за раз)."""
+        known = self.cache.get("custom_emoji") or {}
+        ids = [r[0][7:] for r in self.cache.db.execute(
+            "select distinct emoji from reactions where emoji like 'custom:%'") if r[0][7:] not in known]
+        for i in range(0, len(ids), 200):
+            try:
+                stickers = await self.app.bot.get_custom_emoji_stickers(ids[i:i + 200])
+            except TelegramError as exc:
+                log.warning("премиум-эмодзи: %s", exc)
+                return
+            for st in stickers:
+                known[st.custom_emoji_id] = st.emoji or "⭐"
+        if ids:
+            self.cache.set("custom_emoji", known)
+            self.dirty = True
 
     def card_kb(self, update: Update, uid: int, period: str):
         row = [InlineKeyboardButton(("• " if k == period else "") + t, callback_data=f"st:{uid}:{k}")

@@ -95,7 +95,10 @@ class Renderer:
         if rows:
             by = {}
             for uid, emoji in rows:
-                by.setdefault(emoji if not emoji.startswith("custom:") else "★", []).append(
+                label = self.cache.reaction_label(emoji)
+                if emoji.startswith("custom:"):
+                    label += " (премиум)"
+                by.setdefault(label, []).append(
                     self.name(uid).split(" (@")[0])
             return "; ".join(f"{e} {', '.join(n)}" for e, n in by.items())
         counts = self.cache.db.execute("select emoji, count from reaction_counts where msg_id = ?", (msg_id,)).fetchall()

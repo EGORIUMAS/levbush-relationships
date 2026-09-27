@@ -260,6 +260,14 @@ class Cache:
         return self.db.execute("select * from users where lower(username) = lower(?)",
                                (username.lstrip("@"),)).fetchone()
 
+    def reaction_label(self, key: str) -> str:
+        """Реакция для текста: премиум (custom:ID) → обычный эмодзи-аналог, платная → ⭐."""
+        if key == "paid":
+            return "⭐"
+        if key.startswith("custom:"):
+            return (self.get("custom_emoji") or {}).get(key[7:]) or "★"
+        return key
+
     def aliases(self, spec: str) -> dict[int, int]:
         """LEVBUSH_ALIASES «-100…=@ник,-100…=123» → {id группы/канала: id человека}."""
         out = {}
