@@ -509,36 +509,46 @@ class TG:
 
     async def download_pending(self, limit: int = 500, progress=None) -> int:
         """Скачивает медиа со state=pending (всё, что больше MEDIA_MAX_MB, помечается skip)."""
-        import json
         rows = self.cache.db.execute(
             "select id, date, media, media_meta from messages where media_state = 'pending' order by id desc limit ?",
             (limit,)).fetchall()
         if not rows:
             return 0
+        async with self.io_lock:
+            return await self._download_rows(rows, progress)
+
+    async def download_since(self, since_ts: int, limit: int = 300) -> int:
+        """Медиа за отрезок (для пересказа) — сразу, не дожидаясь очереди начального сбора; темп тот же (pace)."""
+        rows = self.cache.db.execute(
+            """select id, date, media, media_meta from messages where media_state = 'pending' and date >= ?
+               order by id desc limit ?""", (since_ts, limit)).fetchall()
+        return await self._download_rows(rows) if rows else 0
+
+    async def _download_rows(self, rows, progress=None) -> int:
+        import json
         max_bytes = self.cfg.media_max_mb * 1024 * 1024
         done = 0
-        async with self.io_lock:
-            for i in range(0, len(rows), 50):
-                chunk = rows[i:i + 50]
-                msgs = await self.req("media", self.client.get_messages, self.chat, ids=[r["id"] for r in chunk])
-                for r, msg in zip(chunk, msgs):
-                    meta = json.loads(r["media_meta"]) if r["media_meta"] else {}
-                    if msg is None or msg.media is None:
-                        self.cache.set_media(r["id"], "error")
-                        continue
-                    size = getattr(msg.file, "size", None) or meta.get("size") or 0
-                    if size > max_bytes:
-                        self.cache.set_media(r["id"], "skip")
-                        continue
-                    path = self.media_path(r["id"], r["date"], r["media"], meta)
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        await self.req("media", self.client.download_media, msg, file=str(path))
-                        self.cache.set_media(r["id"], "ok", str(path))
-                        done += 1
-                    except Exception as exc:  # noqa: BLE001 — один битый файл не останавливает загрузку
-                        log.warning("медиа #%s: %s", r["id"], exc)
-                        self.cache.set_media(r["id"], "error")
-                if progress:
-                    await progress(done, len(rows), "медиа")
+        for i in range(0, len(rows), 50):
+            chunk = rows[i:i + 50]
+            msgs = await self.req("media", self.client.get_messages, self.chat, ids=[r["id"] for r in chunk])
+            for r, msg in zip(chunk, msgs):
+                meta = json.loads(r["media_meta"]) if r["media_meta"] else {}
+                if msg is None or msg.media is None:
+                    self.cache.set_media(r["id"], "error")
+                    continue
+                size = getattr(msg.file, "size", None) or meta.get("size") or 0
+                if size > max_bytes:
+                    self.cache.set_media(r["id"], "skip")
+                    continue
+                path = self.media_path(r["id"], r["date"], r["media"], meta)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    await self.req("media", self.client.download_media, msg, file=str(path))
+                    self.cache.set_media(r["id"], "ok", str(path))
+                    done += 1
+                except Exception as exc:  # noqa: BLE001 — один битый файл не останавливает загрузку
+                    log.warning("медиа #%s: %s", r["id"], exc)
+                    self.cache.set_media(r["id"], "error")
+            if progress:
+                await progress(done, len(rows), "медиа")
         return done

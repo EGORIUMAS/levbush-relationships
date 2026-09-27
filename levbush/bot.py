@@ -732,8 +732,8 @@ class Levbush:
         async with self.retell_lock:
             try:
                 if self.tg_ok:
-                    await self.tg.sync_history(full_reactions=False)
-                    await self.tg.download_pending(limit=300)
+                    # новые сообщения и так приходят вживую; медиа отрезка — сразу, мимо очереди начального сбора
+                    await self.tg.download_since(since_ts)
                 if not await self.mgr.is_up():
                     await status.edit_text("⏳ Поднимаю Nemotron (~2 мин), потом перескажу…")
                 text = await self.retell.run(since_ts)
