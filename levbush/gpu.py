@@ -22,6 +22,7 @@ from .config import Config
 log = logging.getLogger("levbush.gpu")
 
 UNIT = "levbush-nemotron"
+CUDA_HOME = os.environ.get("CUDA_HOME") or ("/opt/cuda" if Path("/opt/cuda/bin/nvcc").exists() else "/usr/local/cuda")
 SERVED_NAME = "nemotron3-nano-omni"
 
 
@@ -116,7 +117,9 @@ class LLMManager:
             "systemd-run", "--user", f"--unit={UNIT}", "--collect", "--quiet",
             "-p", "MemoryMax=36G", "-p", "MemorySwapMax=0", "-p", "KillSignal=SIGINT", "-p", "TimeoutStopSec=60",
             "--setenv=VLLM_SERVER_DEV_MODE=1", "--setenv=MAX_JOBS=2", "--setenv=NVCC_THREADS=1",
-            "--setenv=FLASHINFER_NVCC_THREADS=1", f"--setenv=PATH={os.environ.get('PATH', '')}",
+            # у systemd --user PATH урезан (/usr/local/bin:/usr/bin): без nvcc FlashInfer не соберёт JIT-ядра
+            "--setenv=FLASHINFER_NVCC_THREADS=1", f"--setenv=CUDA_HOME={CUDA_HOME}",
+            f"--setenv=PATH={CUDA_HOME}/bin:{Path.home()}/.local/bin:{os.environ.get('PATH', '/usr/local/bin:/usr/bin')}",
             f"--setenv=HOME={Path.home()}",
             vllm, "serve", self.cfg.llm_model_path,
             "--served-model-name", SERVED_NAME, "--host", "127.0.0.1", "--port", port,
