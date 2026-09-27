@@ -140,10 +140,12 @@ class Levbush:
     def map_button(self, update: Update, frag: str = "", start: str = "") -> InlineKeyboardButton | None:
         if not self.cfg.webapp_url:
             return None
-        url = self.cfg.webapp_url + (f"#{frag}" if frag else "")
         private = update.effective_chat and update.effective_chat.type == ChatType.PRIVATE
         if private:
-            return InlineKeyboardButton("🗺 Карта", web_app=WebAppInfo(url))
+            # в Mini App хвост # занят данными входа (tgWebAppData) — человек/связь передаются в ?p= / ?r=
+            return InlineKeyboardButton("🗺 Карта", web_app=WebAppInfo(
+                self.cfg.webapp_url + (f"?{frag}" if frag else "")))
+        url = self.cfg.webapp_url + (f"#{frag}" if frag else "")
         if self.cfg.webapp_name and self.app:
             link = f"https://t.me/{self.app.bot.username}/{self.cfg.webapp_name}" + (f"?startapp={start}" if start else "")
             return InlineKeyboardButton("🗺 Карта", url=link)

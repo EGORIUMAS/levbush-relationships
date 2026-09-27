@@ -1372,7 +1372,9 @@
       setData(data);
       if (!deepLinkDone) {
         deepLinkDone = true;
-        let v = parseLink(location.hash);
+        // ?p=ID / ?r=A-B — из кнопок бота (в Mini App хвост # занят данными входа Telegram), #p= — обычные ссылки
+        let v = parseLink(location.hash)
+          || (QS.get('p') ? parseLink('p' + QS.get('p')) : QS.get('r') ? parseLink('r' + QS.get('r')) : null);
         if (!v && TGUI) {
           const sp = TG.initDataUnsafe && TG.initDataUnsafe.start_param;
           v = parseLink(sp);
