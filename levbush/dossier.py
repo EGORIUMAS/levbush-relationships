@@ -11,8 +11,21 @@
 from .render import link_msgs
 
 SECTIONS = {"who": "Кто это", "facts": "Биография", "interests": "Интересы", "character": "Характер и манера общения",
-            "role": "Роль в группе", "timeline": "Хронология"}
+            "quirks": "Мелочи и привычки", "role": "Роль в группе", "timeline": "Хронология"}
+# на чём основана запись: сам сказал / косвенно (вывод из деталей) / со слов других
+BASIS_MARK = {"косвенно": "косвенно", "со слов других": "со слов других"}
 REL_NOTES = {"how": "Как общаются", "bond": "Что их связывает", "dynamics": "Динамика"}
+
+
+def _basis(op: dict) -> str:
+    if op.get("basis") in ("сам", "косвенно", "со слов других"):
+        return op["basis"]
+    return "сам" if op.get("certain", True) else "косвенно"
+
+
+def _mark(e: dict, fmt: str) -> str:
+    basis = e.get("basis") or ("сам" if e.get("certain", True) else "косвенно")
+    return fmt.format(BASIS_MARK[basis]) if basis in BASIS_MARK else ""
 
 
 def empty_dossier() -> dict:
@@ -40,7 +53,8 @@ def apply_person(data: dict, ops: dict, uid: int, day_of) -> int:
         data["next"] += 1
         data["entries"].append({"id": eid, "section": op["section"], "text": op["text"].strip(),
                                 "since": day_of(op.get("msgs")), "changed": None, "prev": None,
-                                "msgs": op.get("msgs", [])[:8], "certain": bool(op.get("certain", True)),
+                                "msgs": op.get("msgs", [])[:8], "basis": _basis(op),
+                                "certain": _basis(op) == "сам",
                                 "removed": None, "why": None})
         n += 1
     for op in ops.get("update", []):
@@ -53,6 +67,9 @@ def apply_person(data: dict, ops: dict, uid: int, day_of) -> int:
         e["changed"] = day_of(op.get("msgs"))
         e["msgs"] = (op.get("msgs") or [])[:8] or e["msgs"]
         e["why"] = op.get("why") or None
+        if op.get("basis"):
+            e["basis"] = _basis(op)
+            e["certain"] = e["basis"] == "сам"
         n += 1
     for op in ops.get("remove", []):
         e = entries.get(op.get("entry"))
@@ -107,7 +124,7 @@ def prompt_person(data: dict | None) -> str:
             continue
         out.append(f"{title}:")
         for e in items:
-            mark = "" if e["certain"] else " (догадка)"
+            mark = _mark(e, " ({})")
             when = f"с {e['since']}" + (f", изм. {e['changed']}" if e["changed"] else "")
             out.append(f"  [{e['id']}] {e['text']}{mark} ({when})")
     return "\n".join(out)
@@ -143,7 +160,7 @@ def render_person(data: dict, chat: dict) -> str:
         out.append(f"## {title}")
         items.sort(key=lambda e: (e["removed"] is not None, e["since"] if key == "timeline" else ""))
         for e in items:
-            guess = " *(догадка)*" if not e["certain"] else ""
+            guess = _mark(e, " *({})*")
             if key == "timeline":
                 line = f"- **{e['since']}** — {e['text']}{guess}"
             else:

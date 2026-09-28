@@ -234,7 +234,7 @@ def test_step(env):
     assert "## Остальные люди группы" in text and "Гоша (@gosha), id 104" in text
     absent = next(x for x in db.saved if x[0] == "dossier" and x[1] == D)
     assert [e["text"] for e in absent[3]["entries"]] == ["со слов Ани: уехал на море"]
-    assert absent[3]["entries"][0]["certain"] is False
+    assert absent[3]["entries"][0]["certain"] is False and absent[3]["entries"][0]["basis"] == "косвенно"
     _, uid, md, data, summary = next(x for x in db.saved if x[0] == "dossier" and x[1] == A)
     base_day = datetime.fromtimestamp(NOW - 5 * 86400 + 60, cfg.tz).strftime("%Y-%m-%d")
     assert uid == A and summary == "активная участница"
@@ -252,7 +252,7 @@ def test_dossier_ops():
                               "certain": True},
                              {"person": 1, "section": "interests", "text": "шахматы", "msgs": [2], "certain": False}]},
                  1, day)
-    assert "[e1] живёт в Москве (с 2025-01-01)" in prompt_person(d) and "(догадка)" in prompt_person(d)
+    assert "[e1] живёт в Москве (с 2025-01-01)" in prompt_person(d) and "шахматы (косвенно)" in prompt_person(d)
     apply_person(d, {"update": [{"person": 1, "entry": "e1", "text": "живёт в Саратове", "msgs": [3],
                                  "why": "переехал"}],
                      "remove": [{"person": 1, "entry": "e2", "msgs": [4], "why": "бросил"}]}, 1, day)
@@ -513,3 +513,17 @@ def test_progress_text_and_eta():
     text = Levbush.progress_text(type("B", (), {})(), st)
     assert "42/857 (4 %)" in text and "переписка за 2026-05-01" in text and "осталось примерно 2 ч" in text
     assert Levbush.progress_text(None, {"state": "done"}) == ""
+
+
+def test_basis_marks():
+    from levbush.dossier import apply_person, empty_dossier, render_person
+    d = empty_dossier()
+    day = lambda msgs: "2025-01-01"  # noqa: E731
+    apply_person(d, {"add": [{"person": 1, "section": "quirks", "text": "пьёт квас литрами", "msgs": [], "basis": "сам"},
+                             {"person": 1, "section": "facts", "text": "со слов Ани: переехал", "msgs": [],
+                              "basis": "со слов других"}]}, 1, day)
+    md = render_person(d, {})
+    assert "## Мелочи и привычки" in md and "пьёт квас литрами — *с" in md and "*(со слов других)*" in md
+    apply_person(d, {"update": [{"person": 1, "entry": "e2", "text": "переехал в Казань", "msgs": [], "why": "подтвердил",
+                                 "basis": "сам"}]}, 1, day)
+    assert d["entries"][1]["basis"] == "сам" and d["entries"][1]["certain"]
