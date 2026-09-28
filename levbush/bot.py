@@ -756,6 +756,46 @@ class Levbush:
         btn = self.map_button(update, f"r={a}-{b}", f"r{a}_{b}")
         return "\n".join(lines), InlineKeyboardMarkup([[btn]]) if btn else None
 
+    @staticmethod
+    def rich_md(text: str) -> str:
+        """Markdown для rich-сообщения: $, ==, ||, < Rich Markdown понимает как разметку (формулы, выделение,
+        спойлер, HTML) — экранируем."""
+        text = re.sub(r"([$<])", r"\\\1", text)
+        return text.replace("==", "=\\=").replace("||", "|\\|")
+
+    @staticmethod
+    def md_escape(text: str) -> str:
+        return re.sub(r"([\\`*_\[\]()#~>|$<=!])", r"\\\1", bidi_close(str(text)))
+
+    async def dossier_md(self, uid: int) -> str | None:
+        """Досье в Markdown для rich-сообщения (None — нет такого участника)."""
+        p = await self.db.call("api_person", uid)
+        if not p:
+            return None
+        d = p.get("dossier")
+        name = self.md_escape(p["person"]["name"])
+        if not d:
+            return f"📄 **{name}**\n\nДосье пока нет — нейросеть ещё не разбирала его переписку."
+        return f"# 📄 {name}\n*досье на {d['as_of'][:10]}*\n\n" + self.rich_md(d["content"] or "")
+
+    async def send_rich(self, message, md: str, fallback_html: str, markup=None):
+        """Rich-сообщение (Bot API 10.1, sendRichMessage) ответом на message; не вышло — обычным HTML."""
+        kwargs = {"chat_id": message.chat_id, "rich_message": {"markdown": md},
+                  "reply_parameters": {"message_id": message.message_id, "allow_sending_without_reply": True}}
+        if markup is not None:
+            kwargs["reply_markup"] = markup.to_dict()
+        if getattr(self, "_rich_ok", True) and len(md) <= 32000:
+            try:
+                return await self.app.bot.do_api_request("sendRichMessage", api_kwargs=kwargs)
+            except TelegramError as exc:
+                if "not found" in str(exc).lower() and "method" in str(exc).lower():
+                    self._rich_ok = False
+                log.warning("rich-сообщение не прошло (%s) — обычным HTML", exc)
+        chunks = split_html(fallback_html)
+        for i, chunk in enumerate(chunks):
+            await message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                     reply_markup=markup if i == len(chunks) - 1 else None)
+
     async def dossier_text(self, uid: int) -> str:
         p = await self.db.call("api_person", uid)
         if not p:
@@ -775,7 +815,12 @@ class Levbush:
             await self.reply(update, "Не нашёл такого участника.")
             return
         btn = self.map_button(update, f"p={uid}", f"p{uid}")
-        await self.reply(update, await self.dossier_text(uid), InlineKeyboardMarkup([[btn]]) if btn else None)
+        md = await self.dossier_md(uid)
+        markup = InlineKeyboardMarkup([[btn]]) if btn else None
+        if md is None:
+            await self.reply(update, "Нет такого участника.")
+            return
+        await self.send_rich(update.effective_message, md, await self.dossier_text(uid), markup)
 
     async def links_text(self, uid: int) -> str:
         p = await self.db.call("api_person", uid)
@@ -1150,8 +1195,9 @@ class Levbush:
                 await q.edit_message_text(await self.top_text(metric, period), parse_mode=ParseMode.HTML,
                                           reply_markup=self.top_kb(metric, period))
             elif kind == "ds":
-                for chunk in split_html(await self.dossier_text(int(rest))):
-                    await q.message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                md = await self.dossier_md(int(rest))
+                if md is not None:
+                    await self.send_rich(q.message, md, await self.dossier_text(int(rest)))
             elif kind == "ln":
                 await q.message.reply_text(await self.links_text(int(rest)), parse_mode=ParseMode.HTML)
             elif kind == "an" and self.is_admin(update):

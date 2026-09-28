@@ -8,6 +8,8 @@
 Связь: {"how": str, "bond": str, "dynamics": str, "notes_changed": {section: date},
         "events": [{"date": "2025-03-01", "text": "…", "msgs": [123]}]}
 """
+import re
+
 from .render import link_msgs
 
 SECTIONS = {"who": "Кто это", "facts": "Биография", "interests": "Интересы", "character": "Характер и манера общения",
@@ -15,6 +17,14 @@ SECTIONS = {"who": "Кто это", "facts": "Биография", "interests": 
 # на чём основана запись: сам сказал / косвенно (вывод из деталей) / со слов других
 BASIS_MARK = {"косвенно": "косвенно", "со слов других": "со слов других"}
 REL_NOTES = {"how": "Как общаются", "bond": "Что их связывает", "dynamics": "Динамика"}
+
+
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uff60]+")
+
+
+def clean(text: str) -> str:
+    """Qwen иногда вставляет китайские слова («…届时 будет 16») — вырезаем иероглифы, кану, хангыль."""
+    return re.sub(r"\s{2,}", " ", _CJK.sub("", text or "")).strip()
 
 
 def _basis(op: dict) -> str:
@@ -51,7 +61,7 @@ def apply_person(data: dict, ops: dict, uid: int, day_of) -> int:
             continue
         eid = f"e{data['next']}"
         data["next"] += 1
-        data["entries"].append({"id": eid, "section": op["section"], "text": op["text"].strip(),
+        data["entries"].append({"id": eid, "section": op["section"], "text": clean(op["text"]),
                                 "since": day_of(op.get("msgs")), "changed": None, "prev": None,
                                 "msgs": op.get("msgs", [])[:8], "basis": _basis(op),
                                 "certain": _basis(op) == "сам",
@@ -61,9 +71,9 @@ def apply_person(data: dict, ops: dict, uid: int, day_of) -> int:
         e = entries.get(op.get("entry"))
         if op.get("person") != uid or e is None or e["removed"] or not op.get("text"):
             continue
-        if op["text"].strip() == e["text"]:
+        if clean(op["text"]) == e["text"]:
             continue
-        e["prev"], e["text"] = e["text"], op["text"].strip()
+        e["prev"], e["text"] = e["text"], clean(op["text"])
         e["changed"] = day_of(op.get("msgs"))
         e["msgs"] = (op.get("msgs") or [])[:8] or e["msgs"]
         e["why"] = op.get("why") or None
@@ -80,7 +90,7 @@ def apply_person(data: dict, ops: dict, uid: int, day_of) -> int:
         n += 1
     for op in ops.get("summaries", []):
         if op.get("person") == uid and op.get("text"):
-            data["summary"] = op["text"].strip()[:300]
+            data["summary"] = clean(op["text"])[:300]
             n += 1
     names = data.setdefault("names", [])
     for op in ops.get("names", []):
@@ -96,12 +106,12 @@ def apply_relation(data: dict, ops: dict, a: int, b: int, day_of) -> int:
     pair = {a, b}
     for op in ops.get("relation_events", []):
         if {op.get("a"), op.get("b")} == pair and op.get("text"):
-            data["events"].append({"date": day_of(op.get("msgs")), "text": op["text"].strip(),
+            data["events"].append({"date": day_of(op.get("msgs")), "text": clean(op["text"]),
                                    "msgs": op.get("msgs", [])[:6]})
             n += 1
     for op in ops.get("relation_notes", []):
         if {op.get("a"), op.get("b")} == pair and op.get("section") in REL_NOTES and op.get("text"):
-            data[op["section"]] = op["text"].strip()
+            data[op["section"]] = clean(op["text"])
             data.setdefault("notes_changed", {})[op["section"]] = day_of(op.get("msgs"))
             n += 1
     data["events"].sort(key=lambda e: e["date"])
