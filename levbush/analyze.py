@@ -869,7 +869,7 @@ class Analyzer:
                 return self.stat
             await self._say(f"🧠 Разбор ({reason}): окон {sum(b - a for a, b in steps)}, шагов {len(steps)}, "
                             f"модель {self.thinker.label}")
-            durations = []
+            durations, down = [], 0
             await self._progress(stage=f"шаги разбора ({self.thinker.label})", done=0, total=len(steps), eta=None,
                                  step_date=None)
             async with self.thinker.use():
@@ -878,13 +878,25 @@ class Analyzer:
                     await self._progress(done=i - 1, step_date=f"{when:%Y-%m-%d}",
                                          eta=self._eta(durations, len(steps) - i + 1))
                     t = time.time()
-                    try:
-                        await self._run_step(wins, a, b, now)
-                        self.stat["windows"] += b - a
-                    except Exception as exc:  # noqa: BLE001 — окно с ошибкой повторится в следующий раз
-                        log.exception("шаг %d", i)
-                        for w in wins[a:b]:
-                            self._mark(w, "error", str(exc)[:300])
+                    for attempt in range(2):
+                        try:
+                            await self._run_step(wins, a, b, now)
+                            self.stat["windows"] += b - a
+                            down = 0
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            log.exception("шаг %d", i)
+                            if await self.thinker.is_up():
+                                # модель жива, не справился сам шаг — окно повторится в следующий раз
+                                for w in wins[a:b]:
+                                    self._mark(w, "error", str(exc)[:300])
+                                break
+                            # модель упала (раньше разбор шёл дальше и помечал ошибкой сотни окон) — поднять и повторить
+                            down += 1
+                            if down >= 3:
+                                raise RuntimeError(f"{self.thinker.label} не поднимается — разбор остановлен") from exc
+                            await self._say(f"⚠️ {self.thinker.label} упал — перезапускаю и повторяю шаг")
+                            await self.thinker.restart()
                     durations.append(time.time() - t)
                     self.stat["steps"] += 1
             self.state = {"state": "done", "finished": int(time.time()), "reason": reason, **self.stat}

@@ -108,7 +108,9 @@ class Config:
     qwen_name: str = field(default_factory=lambda: env("QWEN_NAME", "qwen3.8-27b"))
     qwen_ctx: int = field(default_factory=lambda: env_int("QWEN_CTX", 131072))
     qwen_util: float = field(default_factory=lambda: env_float("QWEN_UTIL", 0.92))
-    qwen_seqs: int = field(default_factory=lambda: env_int("QWEN_SEQS", 2))       # 2 — пересказ во время разбора
+    # 1 слот: при двух запросах с картинками и MTP vLLM 0.27.1 падает (cudaErrorIllegalAddress); пересказ во время
+    # разбора встаёт в очередь за текущим шагом
+    qwen_seqs: int = field(default_factory=lambda: env_int("QWEN_SEQS", 1))
     qwen_mtp: int = field(default_factory=lambda: env_int("QWEN_MTP", 3))          # 0 — без MTP; с MTP только fp8 KV
     qwen_need_gib: float = field(default_factory=lambda: env_float("QWEN_NEED_GIB", 29.0))   # 0,92 × 31,4
     video_frames: int = field(default_factory=lambda: env_int("VIDEO_FRAMES", 4))  # кадров видео/GIF для Qwen
