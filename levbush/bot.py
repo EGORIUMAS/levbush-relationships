@@ -286,10 +286,14 @@ class Levbush:
     async def post_stop(self, app: Application):
         """Задачи отменяем, пока бот ещё на связи: пересказ успеет написать, что прерван."""
         tasks = list(self.bg)
+        was_running = bool(self.analyzer and self.analyzer.running)
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.wait(tasks, timeout=10)
+        if was_running and not self.maintenance:
+            # отмена могла прийти ошибкой (модель уже гасится) и сбросить флаг — разбор всё равно продолжить
+            self.cache.set("analysis_running", "продолжение после перезапуска")
 
     async def post_shutdown(self, app: Application):
         for t in list(self.bg):
