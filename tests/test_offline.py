@@ -257,7 +257,8 @@ def test_dossier_ops():
                                  "why": "переехал"}],
                      "remove": [{"person": 1, "entry": "e2", "msgs": [4], "why": "бросил"}]}, 1, day)
     md = render_person(d, {"id": CHAT})
-    assert "живёт в Саратове — *с 2025-01-01*, *изменено 2025-03-01 (было: «живёт в Москве»)*" in md
+    assert "живёт в Саратове — *с 2025-01-01, обновлено 2025-03-01*" in md and "было" not in md
+    assert d["entries"][0]["prev"] == "живёт в Москве"               # прежний текст — в данных, как история
     assert "~~шахматы~~ — *устарело 2025-04-01: бросил*" in md
     assert "шахматы" not in prompt_person(d)                        # устаревшее нейросети не показываем
     assert apply_person(d, {"update": [{"person": 2, "entry": "e1", "text": "x", "msgs": [], "why": ""}]}, 1, day) == 0

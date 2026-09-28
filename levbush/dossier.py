@@ -161,12 +161,12 @@ def render_person(data: dict, chat: dict) -> str:
         items.sort(key=lambda e: (e["removed"] is not None, e["since"] if key == "timeline" else ""))
         for e in items:
             guess = _mark(e, " *({})*")
+            # прежний текст (e["prev"]) хранится в данных как история, но в досье не выводится
+            upd = f", обновлено {e['changed']}" if e["changed"] else ""
             if key == "timeline":
-                line = f"- **{e['since']}** — {e['text']}{guess}"
+                line = f"- **{e['since']}** — {e['text']}{guess}" + (f" *(обновлено {e['changed']})*" if upd else "")
             else:
-                line = f"- {e['text']}{guess} — *с {e['since']}*"
-            if e["changed"]:
-                line += f", *изменено {e['changed']}" + (f" (было: «{e['prev']}»)" if e["prev"] else "") + "*"
+                line = f"- {e['text']}{guess} — *с {e['since']}{upd}*"
             if e["removed"]:
                 line = f"- ~~{e['text']}~~ — *устарело {e['removed']}" + (f": {e['why']}" if e["why"] else "") + "*"
             out.append(line + _refs(e["msgs"]))
