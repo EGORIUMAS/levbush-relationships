@@ -181,6 +181,13 @@ class Analyzer:
     def ctx(self) -> int:
         return self.cfg.qwen_ctx if self.qwen else self.cfg.llm_ctx
 
+    def budget(self, tokens: int):
+        """Бюджет вложений запроса к модели разбора (у Qwen свой лимит картинок)."""
+        b = self.media.budget(tokens)
+        if self.qwen:
+            b.image = self.cfg.qwen_images
+        return b
+
     def media_parts(self, m, budget) -> list:
         """Вложение для модели разбора: Nemotron получает файл как есть, Qwen — картинки, кадры и описания."""
         if self.qwen:
@@ -699,7 +706,7 @@ class Analyzer:
         entry_ids = [e["id"] for uid in people for e in dossiers[uid]["entries"] if not e["removed"]]
         msg_ids = [m["id"] for m in msgs]
         schema = step_schema([w.id for w in new], people, roster_ids, entry_ids, msg_ids)
-        budget = self.media.budget(self.cfg.step_tokens)
+        budget = self.budget(self.cfg.step_tokens)
         blocks = [(f"=== Окно #{w.id}, {self._span(w)} ===", w.msgs) for w in new]
         content = [L.text(head)] + await asyncio.to_thread(self.interleave, blocks, budget) + [L.text(task)]
         chars = sum(len(p["text"]) for p in content if p["type"] == "text")

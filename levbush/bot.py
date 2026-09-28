@@ -6,6 +6,7 @@
 import asyncio
 import html
 import logging
+import re
 import time
 from datetime import datetime, timedelta
 
@@ -862,13 +863,20 @@ class Levbush:
                 log.exception("пересказ")
                 await status.edit_text(f"❌ Не получилось: {esc(exc)}", parse_mode=ParseMode.HTML)
                 return
-            chunks = split_html(text)
+            # готовый пересказ — новым сообщением ответом на команду (придёт уведомление), «Готовлю…» — удалить
+            asked = update.effective_message
+            for chunk in split_html(text):
+                try:
+                    await asked.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                except BadRequest as exc:
+                    if "not found" in str(exc).lower():          # команду успели удалить — просто в чат
+                        await status.chat.send_message(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    else:
+                        await asked.reply_text(re.sub(r"<[^>]+>", "", chunk)[:4000])
             try:
-                await status.edit_text(chunks[0], parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            except BadRequest:
-                await status.edit_text(chunks[0][:4000])
-            for chunk in chunks[1:]:
-                await status.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                await status.delete()
+            except TelegramError:
+                pass
 
     # ------------------------------------------------------------ расшифровка голосовых и кружков
 

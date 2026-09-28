@@ -112,8 +112,10 @@ class Config:
     qwen_mtp: int = field(default_factory=lambda: env_int("QWEN_MTP", 3))          # 0 — без MTP; с MTP только fp8 KV
     qwen_need_gib: float = field(default_factory=lambda: env_float("QWEN_NEED_GIB", 29.0))   # 0,92 × 31,4
     video_frames: int = field(default_factory=lambda: env_int("VIDEO_FRAMES", 4))  # кадров видео/GIF для Qwen
+    qwen_images: int = field(default_factory=lambda: env_int("QWEN_IMAGES", 40))   # картинок в одном запросе к Qwen
     # шаг разбора: несколько последовательных окон + контекст + текущие досье и связи
-    step_tokens: int = field(default_factory=lambda: env_int("STEP_TOKENS", 60000))   # новые окна: текст + медиа
+    # новые окна: текст + медиа; с досье, связями и контекстом за 48 ч весь промпт ~100–105k (Qwen: контекст 131k)
+    step_tokens: int = field(default_factory=lambda: env_int("STEP_TOKENS", 80000))
     step_context_chars: int = field(default_factory=lambda: env_int("STEP_CONTEXT_CHARS", 30000))  # уже разобранные
     step_relations_chars: int = field(default_factory=lambda: env_int("STEP_RELATIONS_CHARS", 30000))
     step_max_windows: int = field(default_factory=lambda: env_int("STEP_MAX_WINDOWS", 8))

@@ -166,7 +166,7 @@ class Retell:
         return md_to_tg(out, chat)
 
     async def _one(self, llm, budget_tokens, msgs, title, start, end, limit_chars) -> str:
-        budget = self.a.media.budget(budget_tokens)
+        budget = self.a.budget(budget_tokens)
         content = await asyncio.to_thread(       # ffmpeg (кадры) — не в цикле бота
             self.a.interleave, [("Переписка (#номер ЧЧ:ММ Автор ↩кому ответ: текст):", msgs)], budget, True)
         content.append(L.text(PROMPT.format(title=title, start=start, end=end, limit=limit_chars)))

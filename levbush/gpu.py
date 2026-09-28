@@ -155,7 +155,7 @@ class LLMManager:
             cmd = [vllm, "serve", cfg.qwen_model_path, "--served-model-name", cfg.qwen_name,
                    "--max-model-len", str(cfg.qwen_ctx), "--max-num-seqs", str(cfg.qwen_seqs),
                    "--gpu-memory-utilization", str(cfg.qwen_util),
-                   "--limit-mm-per-prompt", json.dumps({"image": cfg.mm_images, "video": 0}),
+                   "--limit-mm-per-prompt", json.dumps({"image": cfg.qwen_images, "video": 0}),
                    "--mm-processor-kwargs", json.dumps({"max_pixels": 1048576}),
                    # без кэша префиксов: с ним MTP на запросах с картинками в vLLM 0.27.1 зависает (генерация 0 ток/с)
                    "--no-enable-prefix-caching", "--reasoning-parser", "qwen3", *common]
