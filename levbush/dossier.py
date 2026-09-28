@@ -10,7 +10,7 @@
 """
 from .render import link_msgs
 
-SECTIONS = {"who": "Кто это", "facts": "Факты", "interests": "Интересы", "character": "Характер и манера общения",
+SECTIONS = {"who": "Кто это", "facts": "Биография", "interests": "Интересы", "character": "Характер и манера общения",
             "role": "Роль в группе", "timeline": "Хронология"}
 REL_NOTES = {"how": "Как общаются", "bond": "Что их связывает", "dynamics": "Динамика"}
 

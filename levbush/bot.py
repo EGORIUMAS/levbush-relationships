@@ -555,7 +555,7 @@ class Levbush:
             "или ответом на сообщение — с него\n/text — расшифровка голосового или кружка (ответом на него; в личке "
             "бота можно просто прислать голосовое)\n/map — карта связей")
         if self.is_admin(update):
-            text += ("\n\nАдмин: /initiate (запуск сбора), /status, /analyze, /describe (описать новые видео и "
+            text += ("\n\nАдмин: /initiate (запуск сбора), /status, /analyze [stop], /describe (описать новые видео и "
                      "голосовые Nemotron'ом сейчас), /sync, "
                      "/maintenance on [причина] | off — техобслуживание")
         btn = self.map_button(update)
@@ -980,6 +980,14 @@ class Levbush:
 
     async def cmd_analyze(self, update: Update, ctx):
         if not self.is_admin(update):
+            return
+        if ctx.args and ctx.args[0].lower() in ("stop", "стоп"):
+            tasks = [t for t in self.bg if t.get_name() in ("разбор", "ежедневный разбор", "описание медиа")]
+            for t in tasks:
+                t.cancel()
+            self.cache.set("analysis_running", None)          # не продолжать сам после перезапуска
+            await self.reply(update, "⏹ Разбор остановлен. Уже разобранное сохранено; продолжить — /analyze."
+                             if tasks else "Разбор и так не идёт.")
             return
         if self.analyzer.running:
             await self.reply(update, "Разбор уже идёт — /status.")

@@ -82,7 +82,7 @@ Telegram-лимиты: паузы `LEVBUSH_TG_HISTORY_DELAY` (1 с на 100 со
 `/stats [@ник]` (или ответом) · `/me` · `/top [метрика] [d|w|m|a]` · `/pair @a [@b]` · `/dossier [@ник]` ·
 `/links [@ник]` · `/retell 2ч | 30м | 14:30 | вчера 20:00` (или ответом на сообщение; не дальше 48 ч) · `/map` ·
 `/text` (ответом на голосовое или кружок — расшифровка Parakeet; в личке достаточно прислать голосовое).
-Админ: `/initiate`, `/status`, `/analyze`, `/describe` (описать новые видео и голосовые Nemotron'ом сейчас), `/sync`,
+Админ: `/initiate`, `/status`, `/analyze` (`/analyze stop` — остановить), `/describe` (описать новые видео и голосовые Nemotron'ом сейчас), `/sync`,
 `/maintenance`. Доступ — участникам группы.
 
 ## CLI
