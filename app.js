@@ -732,10 +732,13 @@
     if (pass && pass.state === 'running') {
       const total = Math.max(0, pass.total || 0), done = Math.max(0, Math.min(total || Infinity, pass.done || 0));
       const pct = total ? (done / total) * 100 : 0;
+      // этап, дата разбираемой переписки и примерное оставшееся время (оценка бота по последним шагам)
+      const note = [pass.note, pass.step_date ? 'переписка за ' + fmtDateShort(pass.step_date) : ''].filter(Boolean).join(' · ');
+      const eta = pass.eta == null ? '' : (pass.eta < 60 ? 'меньше минуты' : '~' + fmtDur(pass.eta));
       passEl.innerHTML = `<div class="pass-bar" role="progressbar" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${done}"><i style="width:${pct.toFixed(1)}%"></i></div>
-        <span class="pass-long">Нейросеть анализирует группу: ${fmtN(done)} из ${fmtN(total)}${pass.note ? ' · ' + esc(pass.note) : ''}</span>
-        <span class="pass-short">Анализ: ${fmtN(done)} из ${fmtN(total)}</span>`;
-      passEl.title = `Нейросеть анализирует группу: ${done} из ${total}${pass.note ? ' · ' + pass.note : ''}`;
+        <span class="pass-long">Нейросеть анализирует группу: ${fmtN(done)} из ${fmtN(total)}${note ? ' · ' + esc(note) : ''}${eta ? ' · осталось ' + esc(eta) : ''}</span>
+        <span class="pass-short">Анализ: ${fmtN(done)} из ${fmtN(total)}${eta ? ' · ' + esc(eta) : ''}</span>`;
+      passEl.title = `Нейросеть анализирует группу: ${done} из ${total}${note ? ' · ' + note : ''}${eta ? ' · осталось ' + eta : ''}`;
       passEl.hidden = false;
     } else {
       passEl.hidden = true;
