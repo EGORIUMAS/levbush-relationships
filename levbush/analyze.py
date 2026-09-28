@@ -292,7 +292,7 @@ class Analyzer:
 
             async def one(m):
                 nonlocal done, last_report
-                parts = self.media.parts(m, self.media.budget(10 ** 6))
+                parts = await asyncio.to_thread(self.media.parts, m, self.media.budget(10 ** 6))   # ffmpeg — в потоке
                 if not parts:
                     self.cache.set_media_desc(m["id"], "", "skip")
                     return
@@ -304,8 +304,10 @@ class Analyzer:
                         text = await llm.chat([{"role": "user", "content": content}], None, max_tokens=400,
                                               temperature=0.2, think=False, retries=1)
                         self.cache.set_media_desc(m["id"], text, "nemotron")
-                    except L.LLMError as exc:        # повторится в следующий раз
-                        log.warning("описание #%s: %s", m["id"], exc)
+                    except L.LLMError as exc:
+                        log.warning("описание #%s: %s", m["id"], str(exc)[:300])
+                        if "HTTP 400" in str(exc):   # Nemotron такое не принимает (звук > 600 с и т.п.) — не повторять
+                            self.cache.set_media_desc(m["id"], "", "error")
                     durations.append((time.time() - t) / self.cfg.llm_parallel)
                 done += 1
                 if report and time.monotonic() - last_report > 20:
@@ -673,7 +675,7 @@ class Analyzer:
         schema = step_schema([w.id for w in new], people, roster_ids, entry_ids, msg_ids)
         budget = self.media.budget(self.cfg.step_tokens)
         blocks = [(f"=== Окно #{w.id}, {self._span(w)} ===", w.msgs) for w in new]
-        content = [L.text(head)] + self.interleave(blocks, budget) + [L.text(task)]
+        content = [L.text(head)] + await asyncio.to_thread(self.interleave, blocks, budget) + [L.text(task)]
         chars = sum(len(p["text"]) for p in content if p["type"] == "text")
         media_tokens = self.cfg.step_tokens - budget.tokens
         est = int(chars / CHARS_PER_TOKEN) + media_tokens
@@ -802,6 +804,7 @@ class Analyzer:
         self.stat = {"transcribed": 0, "described": 0, "windows": 0, "steps": 0, "dossiers": 0, "relations": 0}
         self._text_cache, self._tok_cache = {}, {}
         self._names = None                       # указатель имён перечитывается из досье в начале прогона
+        self.cache.set("analysis_running", reason)       # перезапуск бота посреди разбора — продолжит сам
         try:
             self.state = {"state": "running", "reason": reason, "started": int(started)}
             await self._progress(stage="подготовка")
@@ -809,9 +812,10 @@ class Analyzer:
             if self.qwen:                               # Qwen не слышит и не видит видео — сначала описания
                 self.stat["described"] = await self.describe_pending()
             now = int(time.time())
-            msgs = self.load_messages()
-            wins = self.windows(msgs)
-            steps = self.plan(wins, now)
+            await self._progress(stage="подготовка окон переписки", done=0, total=0, eta=None)
+            msgs = await asyncio.to_thread(self.load_messages)      # тяжёлое — не в цикле бота
+            wins = await asyncio.to_thread(self.windows, msgs)
+            steps = await asyncio.to_thread(self.plan, wins, now)
             if not steps:
                 await self._progress(state="done", stage="нечего разбирать")
                 return self.stat
@@ -844,14 +848,18 @@ class Analyzer:
                             f"{self.stat['relations']}" + (f". Окон с ошибкой: {errors} — повторю в следующий раз"
                                                           if errors else ""))
             self.cache.db.execute("delete from analyzed where status = 'error'")
+            self.cache.set("analysis_running", None)
             return self.stat
         except asyncio.CancelledError:
-            # остановлен (техобслуживание): разобранные окна сохранены, продолжится со следующего
+            # остановлен (техобслуживание или перезапуск): разобранные окна сохранены, продолжится со следующего
             self.state = {"state": "stopped", "stage": "остановлен", "updated": int(time.time())}
             try:
                 await asyncio.shield(self.db.set_pass(self.state))
             except Exception:  # noqa: BLE001
                 pass
+            raise
+        except Exception:
+            self.cache.set("analysis_running", None)
             raise
         except Exception as exc:
             self.state = {"state": "error", "error": str(exc)[:500], "updated": int(time.time())}

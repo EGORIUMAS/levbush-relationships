@@ -98,24 +98,26 @@ class Retell:
 
     @asynccontextmanager
     async def server(self):
-        """(клиент, контекст): свой поднятый Qwen → общий :8080 → поднять свой Qwen. Без Qwen — Nemotron."""
-        q = self.a.qwen
+        """(клиент, контекст). Порядок: свой Qwen, если поднят → Nemotron, если поднят или поднимается (разбор описывает
+        медиа — не ждать конца этапа) → общий :8080 → поднять свой Qwen. Чужие модели пересказ не гасит."""
+        q, nem = self.a.qwen, self.a.mgr
+        if q is None or not await q.is_up():
+            if nem.unit_active():
+                async with nem.use():
+                    log.info("пересказ — на Nemotron (он уже поднят)")
+                    yield L.LLM(nem.url, nem.model), self.cfg.llm_ctx
+                return
         if q is None:
-            async with self.a.mgr.use():
-                yield L.LLM(self.a.mgr.url, self.a.mgr.model), self.cfg.llm_ctx
+            async with nem.use():
+                yield L.LLM(nem.url, nem.model), self.cfg.llm_ctx
             return
         if not await q.is_up():
             shared = await served_models(self.cfg.fallback_llm_url)
             if shared:
-                nem = self.a.mgr                      # спящему vLLM на :8080 нужна VRAM — свой Nemotron гасим
-                if nem.unit_active() and nem.users == 0:
-                    async with nem._lock:
-                        await nem.stop(wake_shared=False)
-                if not nem.unit_active():
-                    log.info("пересказ — на общем сервере %s (%s)", self.cfg.fallback_llm_url, shared[0]["id"])
-                    yield (L.LLM(self.cfg.fallback_llm_url, shared[0]["id"], timeout=1800),
-                           int(shared[0].get("max_model_len") or 131072))
-                    return
+                log.info("пересказ — на общем сервере %s (%s)", self.cfg.fallback_llm_url, shared[0]["id"])
+                yield (L.LLM(self.cfg.fallback_llm_url, shared[0]["id"], timeout=1800),
+                       int(shared[0].get("max_model_len") or 131072))
+                return
         async with q.use():
             yield L.LLM(q.url, q.model or q.fixed_model), self.cfg.qwen_ctx
 
@@ -165,7 +167,8 @@ class Retell:
 
     async def _one(self, llm, budget_tokens, msgs, title, start, end, limit_chars) -> str:
         budget = self.a.media.budget(budget_tokens)
-        content = self.a.interleave([("Переписка (#номер ЧЧ:ММ Автор ↩кому ответ: текст):", msgs)], budget, compact=True)
+        content = await asyncio.to_thread(       # ffmpeg (кадры) — не в цикле бота
+            self.a.interleave, [("Переписка (#номер ЧЧ:ММ Автор ↩кому ответ: текст):", msgs)], budget, True)
         content.append(L.text(PROMPT.format(title=title, start=start, end=end, limit=limit_chars)))
         think = dict(think=self.cfg.retell_think_budget > 0, think_budget=self.cfg.retell_think_budget)
         try:

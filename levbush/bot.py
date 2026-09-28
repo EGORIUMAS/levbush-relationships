@@ -263,9 +263,20 @@ class Levbush:
                 await self.notify_admin("🔧 Бот запущен в режиме техобслуживания — /maintenance off, чтобы выйти")
             else:
                 self.spawn(self.startup_sync(), "синхронизация")
+                if self.cache.get("analysis_running"):         # разбор прервал перезапуск — продолжаем
+                    await self.notify_admin("🔄 Продолжаю прерванный разбор")
+                    self.spawn(self.analyzer.run("продолжение после перезапуска"), "разбор")
         elif self.tg_ok:
             await self.notify_admin("✅ Бот запущен, Telethon подключён к «" + str(self.chat.get("title")) + "».\n"
                                     "Сбор ещё не запускался — /initiate, когда будешь готов.")
+
+    async def post_stop(self, app: Application):
+        """Задачи отменяем, пока бот ещё на связи: пересказ успеет написать, что прерван."""
+        tasks = list(self.bg)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=10)
 
     async def post_shutdown(self, app: Application):
         for t in list(self.bg):
@@ -831,7 +842,9 @@ class Levbush:
 
                 text = await self.retell.run(since_ts, progress=progress)
             except asyncio.CancelledError:
-                await asyncio.shield(status.edit_text("🔧 Пересказ прерван: бот ушёл на техобслуживание."))
+                why = ("бот ушёл на техобслуживание" if self.maintenance
+                       else "бот перезапускается — попробуй ещё раз через минуту")
+                await asyncio.shield(status.edit_text(f"🔧 Пересказ прерван: {why}."))
                 raise
             except Exception as exc:  # noqa: BLE001
                 log.exception("пересказ")
@@ -1035,6 +1048,8 @@ class Levbush:
             await self.announce("✅ Техобслуживание закончено, бот снова работает.")
             if self.tg_ok and self.initiated and not self.busy("синхронизация"):
                 self.spawn(self.startup_sync(), "синхронизация")        # докачать пропущенное
+            if self.cache.get("analysis_running") and not self.analyzer.running:
+                self.spawn(self.analyzer.run("продолжение после техобслуживания"), "разбор")
             self.dirty = True
             await self.reply(update, "✅ Техобслуживание выключено, докачиваю пропущенное.")
         else:
@@ -1125,7 +1140,7 @@ def build(config: Config = cfg) -> Application:
         raise SystemExit("нет LEVBUSH_BOT_TOKEN в ~/.config/levbush.env")
     lb = Levbush(config)
     app = (Application.builder().token(config.bot_token).rate_limiter(AIORateLimiter(max_retries=3))
-           .post_init(lb.post_init).post_shutdown(lb.post_shutdown).concurrent_updates(True).build())
+           .post_init(lb.post_init).post_stop(lb.post_stop).post_shutdown(lb.post_shutdown).concurrent_updates(True).build())
     app.bot_data["levbush"] = lb
     cmds = {"help": lb.cmd_help, "start": lb.cmd_help, "stats": lb.cmd_stats, "me": lb.cmd_me, "top": lb.cmd_top,
             "pair": lb.cmd_pair, "dossier": lb.cmd_dossier, "links": lb.cmd_links, "map": lb.cmd_map,
