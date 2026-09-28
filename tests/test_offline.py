@@ -419,3 +419,45 @@ def test_wanted_media():
                 {"file_name": "app.apk", "mime": "application/vnd.android.package-archive"}):
         assert not wanted("document", bad)
     assert not wanted("poll", {}) and not wanted("webpage", {})
+
+
+def test_maintenance_guard(tmp_path):
+    from levbush.bot import Levbush
+    lb = Levbush.__new__(Levbush)
+    lb.cfg = Config()
+    lb.cfg.admin_id = 1
+    lb.cache = Cache(tmp_path / "c.db")
+    replies, calls = [], []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd(uid):
+        return type("U", (), {"effective_user": type("X", (), {"id": uid})(), "effective_message": Msg(),
+                              "callback_query": None})()
+
+    async def handler(update, ctx):
+        calls.append(update.effective_user.id)
+
+    guarded = lb.guard(handler)
+
+    async def go():
+        await guarded(upd(2), None)                        # режима нет — участнику можно
+        lb.cache.set("maintenance", {"since": 0, "reason": "обновляю базу"})
+        await guarded(upd(2), None)                        # участнику нельзя
+        await guarded(upd(1), None)                        # админу можно
+        lb.cache.set("maintenance", None)
+        await guarded(upd(2), None)
+
+    asyncio.run(go())
+    assert calls == [2, 1, 2]
+    assert len(replies) == 1 and "техобслуживание: обновляю базу" in replies[0]
+
+
+def test_bidi_close():
+    from levbush.bot import bidi_close, esc
+    nick = 'maxim("⁧("'
+    assert bidi_close(nick) == nick + "⁩" and bidi_close("Аня") == "Аня"
+    assert bidi_close("a⁧b⁩") == "a⁧b⁩"          # уже закрыт — не трогаем
+    assert esc(nick).endswith("⁩")

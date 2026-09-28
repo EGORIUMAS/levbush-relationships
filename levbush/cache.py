@@ -182,7 +182,7 @@ class Cache:
         row["deleted"] = row["deleted"] or 0
         cols = ", ".join(MSG_FIELDS)
         marks = ", ".join("?" for _ in MSG_FIELDS)
-        keep = {"id", "media_path", "media_state", "deleted"}
+        keep = {"id", "media_path", "media_state", "deleted", "source"}   # source — кто принёс первым
         updates = ", ".join(f"{k} = coalesce(excluded.{k}, {k})" if k in ("edit_date", "text", "entities", "media_meta")
                             else f"{k} = excluded.{k}" for k in MSG_FIELDS if k not in keep)
         db.execute(f"insert into messages({cols}) values ({marks}) on conflict(id) do update set {updates}, "

@@ -112,9 +112,9 @@ class Config:
     mm_images: int = field(default_factory=lambda: env_int("MM_IMAGES", 24))
     mm_videos: int = field(default_factory=lambda: env_int("MM_VIDEOS", 6))
     mm_audio: int = field(default_factory=lambda: env_int("MM_AUDIO", 12))
-    tok_image: int = field(default_factory=lambda: env_int("TOK_IMAGE", 1100))
+    tok_image: int = field(default_factory=lambda: env_int("TOK_IMAGE", 1100))   # если размер картинки не прочитать
     tok_audio_sec: float = field(default_factory=lambda: env_float("TOK_AUDIO_SEC", 13))
-    tok_video_frame: int = field(default_factory=lambda: env_int("TOK_VIDEO_FRAME", 140))
+    tok_video_frame: int = field(default_factory=lambda: env_int("TOK_VIDEO_FRAME", 90))    # замер: 76–93
     video_fps: float = field(default_factory=lambda: env_float("VIDEO_FPS", 2))
     video_max_frames: int = field(default_factory=lambda: env_int("VIDEO_MAX_FRAMES", 128))
     context_hours: int = field(default_factory=lambda: env_int("CONTEXT_HOURS", 48))   # «два последних дня»

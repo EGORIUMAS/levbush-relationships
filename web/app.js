@@ -19,7 +19,13 @@
   /* ------------------------------------------------------------------ utils */
 
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ESC[c]);
+  // незакрытые управляющие символы направления в никах (maxim("⁧(" прячет U+2067) переворачивают соседний текст
+  const bidiClose = (t) => {
+    const n = (re) => (t.match(re) || []).length;
+    const iso = n(/[\u2066-\u2068]/g) - n(/\u2069/g), emb = n(/[\u202A\u202B\u202D\u202E]/g) - n(/\u202C/g);
+    return t + '\u202C'.repeat(Math.max(0, emb)) + '\u2069'.repeat(Math.max(0, iso));
+  };
+  const esc = (s) => bidiClose(String(s == null ? '' : s)).replace(/[&<>"']/g, (c) => ESC[c]);
   const clamp01 = (x) => Math.max(0, Math.min(1, Number(x) || 0));
   const lkey = (a, b) => (a < b ? `${a}-${b}` : `${b}-${a}`);
   const isMobile = () => mqMobile.matches;

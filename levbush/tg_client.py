@@ -191,10 +191,11 @@ class TG:
                 self.cache.upsert_user(tt_user_row(ent))
         return info
 
-    # ------------------------------------------------------------ живой сбор (без прав админа у бота)
+    # ------------------------------------------------------------ живой сбор: реакции и удаления
 
     def start_live(self, on_change=None):
-        """Новые сообщения, правки, удаления, входы/выходы и реакции — прямо через аккаунт пользователя.
+        """Живой сбор через аккаунт — только то, чего бот без прав админа не получает: реакции поимённо и удаления.
+        Новые сообщения, правки и входы/выходы принимает сам бот (privacy mode выключен).
         on_change() вызывается после каждой записи в кэш (бот помечает статистику устаревшей)."""
         from telethon import events
         c = self.client
@@ -202,27 +203,6 @@ class TG:
         def changed():
             if on_change:
                 on_change()
-
-        @c.on(events.NewMessage(chats=self.chat))
-        @c.on(events.MessageEdited(chats=self.chat))
-        async def _msg(ev):
-            self._store_batch([ev.message])
-            changed()
-
-        @c.on(events.ChatAction(chats=self.chat))
-        async def _action(ev):
-            if ev.action_message is not None:
-                self._store_batch([ev.action_message])
-            else:
-                now = int(time.time())
-                for uid in ev.user_ids or []:
-                    if ev.user_joined or ev.user_added:
-                        self.cache.add_membership(uid, now, "join", "live")
-                        self.cache.upsert_user({"id": uid, "is_member": 1})
-                    elif ev.user_left or ev.user_kicked:
-                        self.cache.add_membership(uid, now, "leave", "live")
-                        self.cache.upsert_user({"id": uid, "is_member": 0})
-            changed()
 
         @c.on(events.MessageDeleted(chats=self.chat))
         async def _deleted(ev):

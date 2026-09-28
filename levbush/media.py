@@ -5,10 +5,13 @@
 - звук в контейнере, который не читает libsndfile (m4a/aac…), → wav;
 - у видео со звуком дорожка идёт отдельным звуком сразу после видео: режим use_audio_in_video в vLLM требует,
   чтобы звуков в запросе было ровно столько же, сколько видео, и ломается от любого отдельного голосового;
-- видео без звуковой дорожки (GIF, немое) → несколько кадров.
+- видео без звуковой дорожки (GIF, немое) → несколько кадров;
+- видео другого разрешения, чем первое в запросе, → кадрами (+ звук): vLLM не принимает в одном запросе видео
+  разного размера («Failed to apply NanoNemotronVLProcessor»), по отдельности они проходят.
 Речь дополнительно расшифровывает Parakeet (Nemotron понимает только английскую речь) — текст в переписке.
 """
 import json
+import math
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +19,7 @@ from pathlib import Path
 from . import llm as L
 from .config import Config
 
-SNDFILE_EXT = {".ogg", ".oga", ".opus", ".wav", ".mp3", ".flac"}
+SNDFILE_EXT = {".ogg", ".oga", ".opus", ".wav", ".flac"}   # mp3 vLLM не открывает («File does not exist»)
 LABEL = {"photo": "фото", "video": "видео", "video_note": "кружок", "voice": "голосовое", "audio": "аудио",
          "gif": "GIF", "document": "файл", "sticker": "стикер"}
 
@@ -29,6 +32,7 @@ class Budget:
     audio: int
     tokens: int
     audio_in_video: bool = False
+    video_size: tuple | None = None    # разрешение видео в запросе: vLLM падает на видео разного размера
     dropped: list = field(default_factory=list)
 
 
@@ -38,11 +42,38 @@ class Media:
         self.conv = cfg.data_dir / "conv"
         self.conv.mkdir(parents=True, exist_ok=True)
         self._audio_cache: dict[str, bool] = {}
+        self._size_cache: dict[str, tuple | None] = {}
+        self._tok_cache: dict[str, int] = {}
 
     def budget(self, tokens: int) -> Budget:
         return Budget(self.cfg.mm_images, self.cfg.mm_videos, self.cfg.mm_audio, tokens)
 
     # ------------------------------------------------------------ подготовка файлов
+
+    def video_size(self, path: str) -> tuple | None:
+        if path not in self._size_cache:
+            out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                  "stream=width,height", "-of", "csv=p=0", path], capture_output=True, text=True).stdout
+            try:
+                w, h = (int(x) for x in out.strip().split(",")[:2])
+                self._size_cache[path] = (w, h)
+            except ValueError:
+                self._size_cache[path] = None
+        return self._size_cache[path]
+
+    def image_tokens(self, path) -> int:
+        """Замер на Nemotron: картинка режется на плитки 512×512 (до 12) + уменьшенная копия, 256 токенов на плитку.
+        568×186 → 283 токена, 1920×2560 → 3286."""
+        key = str(path)
+        if key not in self._tok_cache:
+            try:
+                from PIL import Image
+                w, h = Image.open(path).size
+                tiles = min(12, math.ceil(w / 512) * math.ceil(h / 512))
+                self._tok_cache[key] = 256 * (tiles + (1 if tiles > 1 else 0)) + 30
+            except Exception:  # noqa: BLE001
+                self._tok_cache[key] = self.cfg.tok_image
+        return self._tok_cache[key]
 
     def has_audio(self, path: str) -> bool:
         if path not in self._audio_cache:
@@ -118,7 +149,7 @@ class Media:
 
         def images(paths):
             paths = paths[:budget.image]
-            cost = cfg.tok_image * len(paths)
+            cost = sum(self.image_tokens(p) for p in paths)
             if not paths or cost > budget.tokens:
                 budget.dropped.append(m["id"])
                 return []
@@ -151,9 +182,16 @@ class Media:
                 return images(self._frames(path, m["id"], dur))
             frames = min(cfg.video_max_frames, max(1, int(dur * cfg.video_fps)))
             cost = frames * cfg.tok_video_frame + int(dur * cfg.tok_audio_sec) + 50
+            size = self.video_size(path)
             wav = self._wav(path, m["id"]) if budget.audio >= 1 else None
-            if budget.video < 1 or wav is None or cost > budget.tokens:
-                return images(self._frames(path, m["id"], dur))
+            if (budget.video < 1 or wav is None or cost > budget.tokens or size is None
+                    or (budget.video_size is not None and size != budget.video_size)):
+                frames = images(self._frames(path, m["id"], dur))
+                if frames and wav is not None and budget.audio >= 1:
+                    budget.audio -= 1
+                    frames += [L.text(f"Звук из #{m['id']}:"), L.audio(wav)]
+                return frames
+            budget.video_size = size
             budget.video -= 1
             budget.audio -= 1
             budget.tokens -= cost

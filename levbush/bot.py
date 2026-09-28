@@ -1,9 +1,7 @@
 """Levbush Relationships — бот: статистика, досье, связи, пересказ, карта.
 
-Один процесс: PTB (команды) + Telethon (история и живой сбор: сообщения, правки, удаления, реакции поимённо,
-входы/выходы, медиа, профили) + задания (статистика, ежедневный разбор).
-Боту права админа не нужны. Если он всё же админ с выключенным privacy mode, его обновления тоже пишутся в кэш
-(дубли безвредны) — это страховка на случай, когда Telethon отвалился.
+Один процесс: PTB — команды и новые сообщения, правки, входы/выходы (privacy mode выключен); Telethon — история,
+докачка пропущенного, реакции поимённо, удаления, медиа, аватарки; задания — статистика, ежедневный разбор.
 """
 import asyncio
 import html
@@ -42,8 +40,16 @@ TOP_METRICS = ["msgs", "replies", "quotes", "reactions", "reactions_recv", "medi
                "stickers", "forwards", "mentions", "words"]
 
 
+def bidi_close(text: str) -> str:
+    """Закрывает незакрытые управляющие символы направления (ник maxim("⁧(" прячет U+2067 RLI): иначе весь текст
+    после имени до конца строки переворачивается справа налево. Сам ник выглядит так же."""
+    isolates = sum(text.count(c) for c in "\u2066\u2067\u2068") - text.count("\u2069")
+    embeds = sum(text.count(c) for c in "\u202a\u202b\u202d\u202e") - text.count("\u202c")
+    return text + "\u202c" * max(0, embeds) + "\u2069" * max(0, isolates)
+
+
 def esc(x) -> str:
-    return html.escape(str(x), quote=False)
+    return html.escape(bidi_close(str(x)), quote=False)
 
 
 def split_html(text: str, limit: int = 4000) -> list[str]:
@@ -200,7 +206,10 @@ class Levbush:
                                                                            microsecond=0).timetz())
         if self.tg_ok and self.initiated:
             self.tg.start_live(on_change=self.mark_dirty)
-            self.spawn(self.startup_sync(), "синхронизация")
+            if self.maintenance:
+                await self.notify_admin("🔧 Бот запущен в режиме техобслуживания — /maintenance off, чтобы выйти")
+            else:
+                self.spawn(self.startup_sync(), "синхронизация")
         elif self.tg_ok:
             await self.notify_admin("✅ Бот запущен, Telethon подключён к «" + str(self.chat.get("title")) + "».\n"
                                     "Сбор ещё не запускался — /initiate, когда будешь готов.")
@@ -269,6 +278,8 @@ class Levbush:
         log.info("статистика выгружена: %s", sent)
 
     async def job_stats(self, ctx: ContextTypes.DEFAULT_TYPE):
+        if self.maintenance:
+            return
         try:
             await self.push_stats()
         except Exception:  # noqa: BLE001
@@ -279,14 +290,14 @@ class Levbush:
         self.dirty = True
 
     async def job_reactions(self, ctx):
-        if self.tg_ok and self.initiated and not self.busy("синхронизация"):
+        if self.tg_ok and self.initiated and not self.maintenance and not self.busy("синхронизация"):
             try:
                 await self.tg.flush_reactions()
             except Exception:  # noqa: BLE001
                 log.exception("реакции")
 
     async def job_media(self, ctx):
-        if self.tg_ok and self.initiated and not self.busy("синхронизация"):
+        if self.tg_ok and self.initiated and not self.maintenance and not self.busy("синхронизация"):
             try:
                 await self.tg.download_pending(limit=200)
             except Exception:  # noqa: BLE001
@@ -316,7 +327,7 @@ class Levbush:
         return n
 
     async def job_participants(self, ctx):
-        if self.tg_ok and self.initiated and not self.busy("синхронизация"):
+        if self.tg_ok and self.initiated and not self.maintenance and not self.busy("синхронизация"):
             try:
                 await self.tg.sync_participants()
                 await self.refresh_names()
@@ -325,7 +336,7 @@ class Levbush:
                 log.exception("участники")
 
     async def job_daily(self, ctx):
-        if self.initiated and not self.busy("ежедневный разбор"):
+        if self.initiated and not self.maintenance and not self.busy("ежедневный разбор"):
             self.spawn(self.daily(), "ежедневный разбор")
 
     @property
@@ -463,7 +474,8 @@ class Levbush:
             f"/retell 2ч | 30м | 14:30 | вчера 20:00 — пересказ (не дальше {self.cfg.retell_max_hours} ч), "
             "или ответом на сообщение — с него\n/map — карта связей")
         if self.is_admin(update):
-            text += "\n\nАдмин: /initiate (запуск сбора), /status, /analyze, /sync"
+            text += ("\n\nАдмин: /initiate (запуск сбора), /status, /analyze, /sync, "
+                     "/maintenance on [причина] | off — техобслуживание")
         btn = self.map_button(update)
         await self.reply(update, text, InlineKeyboardMarkup([[btn]]) if btn else None)
 
@@ -748,6 +760,9 @@ class Levbush:
                 if not await self.mgr.is_up():
                     await status.edit_text("⏳ Поднимаю Nemotron (~2 мин), потом перескажу…")
                 text = await self.retell.run(since_ts)
+            except asyncio.CancelledError:
+                await asyncio.shield(status.edit_text("🔧 Пересказ прерван: бот ушёл на техобслуживание."))
+                raise
             except Exception as exc:  # noqa: BLE001
                 log.exception("пересказ")
                 await status.edit_text(f"❌ Не получилось: {esc(exc)}", parse_mode=ParseMode.HTML)
@@ -799,6 +814,74 @@ class Levbush:
         self.cache.set("analysis_started", int(time.time()))
         self.spawn(self.analyzer.run("вручную"), "разбор")
         await self.reply(update, "🧠 Запустил разбор. Прогресс — /status и на карте.")
+
+    # ------------------------------------------------------------ техобслуживание
+
+    @property
+    def maintenance(self) -> dict | None:
+        return self.cache.get("maintenance") or None
+
+    def guard(self, fn):
+        """Во время техобслуживания команды и кнопки работают только у админа."""
+        async def wrapped(update: Update, ctx):
+            if self.maintenance and not self.is_admin(update):
+                m = self.maintenance
+                text = "🔧 Идёт техобслуживание" + (f": {m['reason']}" if m.get("reason") else "") + \
+                       ". Попробуй позже — сообщения группы по-прежнему учитываются."
+                if update.callback_query:
+                    await update.callback_query.answer(text[:200], show_alert=True)
+                elif update.effective_message:
+                    await update.effective_message.reply_text(text)
+                return
+            return await fn(update, ctx)
+        return wrapped
+
+    async def announce(self, text: str):
+        """Сообщение участникам — в группу."""
+        if self.chat_id:
+            try:
+                await self.app.bot.send_message(self.chat_id, text)
+            except TelegramError as exc:
+                log.warning("в группу не отправилось: %s", exc)
+
+    async def cmd_maintenance(self, update: Update, ctx):
+        if not self.is_admin(update):
+            return
+        arg = (ctx.args[0].lower() if ctx.args else "")
+        reason = " ".join(ctx.args[1:]).strip()
+        m = self.maintenance
+        if arg in ("on", "вкл"):
+            if m:
+                await self.reply(update, "Техобслуживание уже включено.")
+                return
+            self.cache.set("maintenance", {"since": int(time.time()), "reason": reason})
+            stopped = [t.get_name() for t in list(self.bg)]
+            for t in list(self.bg):
+                t.cancel()
+            if self.mgr.started_by_us:
+                await self.mgr.stop()
+            await self.announce("🔧 Бот уходит на техобслуживание" + (f": {reason}" if reason else "") +
+                                ". Команды временно не работают, сообщения группы по-прежнему учитываются.")
+            await self.reply(update, "🔧 Техобслуживание включено." +
+                             (f" Остановлено: {', '.join(stopped)}." if stopped else " Задач не было.") +
+                             " Выключить — /maintenance off")
+        elif arg in ("off", "выкл"):
+            if not m:
+                await self.reply(update, "Техобслуживание и так выключено.")
+                return
+            self.cache.set("maintenance", None)
+            await self.announce("✅ Техобслуживание закончено, бот снова работает.")
+            if self.tg_ok and self.initiated and not self.busy("синхронизация"):
+                self.spawn(self.startup_sync(), "синхронизация")        # докачать пропущенное
+            self.dirty = True
+            await self.reply(update, "✅ Техобслуживание выключено, докачиваю пропущенное.")
+        else:
+            if m:
+                since = datetime.fromtimestamp(m["since"], self.cfg.tz)
+                await self.reply(update, f"🔧 Техобслуживание включено с {since:%d.%m %H:%M}" +
+                                 (f": {esc(m['reason'])}" if m.get("reason") else "") + ". Выключить — /maintenance off")
+            else:
+                await self.reply(update, "Техобслуживание выключено. Включить — /maintenance on [причина]")
 
     async def cmd_initiate(self, update: Update, ctx):
         if not self.is_admin(update):
@@ -886,14 +969,15 @@ def build(config: Config = cfg) -> Application:
             "pair": lb.cmd_pair, "dossier": lb.cmd_dossier, "links": lb.cmd_links, "map": lb.cmd_map,
             "retell": lb.cmd_retell, "status": lb.cmd_status, "analyze": lb.cmd_analyze, "sync": lb.cmd_sync,
             "initiate": lb.cmd_initiate}
+    cmds["maintenance"] = lb.cmd_maintenance
     for name, fn in cmds.items():
-        app.add_handler(CommandHandler(name, fn), group=1)
+        app.add_handler(CommandHandler(name, lb.guard(fn)), group=1)
     # сбор — отдельной группой обработчиков, чтобы команды в группе тоже попадали в кэш
     app.add_handler(MessageHandler(filters.ALL, lb.on_message), group=0)
     app.add_handler(MessageReactionHandler(lb.on_reaction, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED), group=0)
     app.add_handler(MessageReactionHandler(lb.on_reaction_count, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_COUNT_UPDATED), group=0)
     app.add_handler(ChatMemberHandler(lb.on_member, ChatMemberHandler.CHAT_MEMBER), group=0)
-    app.add_handler(CallbackQueryHandler(lb.on_button), group=1)
+    app.add_handler(CallbackQueryHandler(lb.guard(lb.on_button)), group=1)
     return app
 
 

@@ -703,6 +703,14 @@ class Analyzer:
                                                           if errors else ""))
             self.cache.db.execute("delete from analyzed where status = 'error'")
             return self.stat
+        except asyncio.CancelledError:
+            # остановлен (техобслуживание): разобранные окна сохранены, продолжится со следующего
+            self.state = {"state": "stopped", "stage": "остановлен", "updated": int(time.time())}
+            try:
+                await asyncio.shield(self.db.set_pass(self.state))
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         except Exception as exc:
             self.state = {"state": "error", "error": str(exc)[:500], "updated": int(time.time())}
             await self.db.set_pass(self.state)
