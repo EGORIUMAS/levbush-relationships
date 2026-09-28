@@ -1,6 +1,7 @@
 """Сообщения кэша → текст для нейросети (разбор эпизодов, пересказ) и ссылки на сообщения."""
 import json
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -47,6 +48,16 @@ def fmt_dur(sec) -> str:
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+# пустые на вид буквы: хангыль-заполнители, пустой шрифт Брайля
+BLANK = {"\u115f", "\u1160", "\u3164", "\uffa0", "\u2800"}
+
+
+def visible(text: str | None) -> bool:
+    """Есть ли в имени хоть один видимый символ: имя из одних селекторов вариантов, пробелов и заполнителей
+    нейросеть не может ни прочитать, ни назвать — вместо него показываем ник."""
+    return any(unicodedata.category(ch)[0] not in "MCZ" and ch not in BLANK for ch in text or "")
+
+
 class Renderer:
     def __init__(self, cache: Cache, cfg: Config):
         self.cache, self.cfg = cache, cfg
@@ -68,7 +79,9 @@ class Renderer:
         if u is None:
             label = f"id{uid}"
         else:
-            label = " ".join(x for x in (u["first_name"], u["last_name"]) if x) or (u["username"] or f"id{uid}")
+            label = " ".join(x for x in (u["first_name"], u["last_name"]) if visible(x)) or (u["username"] or f"id{uid}")
+            if u["is_bot"]:
+                label += " [бот]"            # до ника: short() его сохраняет — нейросеть не примет бота за человека
             if u["username"]:
                 label += f" (@{u['username']})"
         if uid == self.chat.get("channel_id"):

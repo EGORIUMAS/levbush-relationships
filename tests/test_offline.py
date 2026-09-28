@@ -352,6 +352,8 @@ def test_alias_bots_contact_names(tmp_path):
     an = Analyzer(cfg, cache, db=None, mgr=None)
     assert an._persons(an.load_messages()) == [LEV, A]
     assert "Лев (@levbush) [пишет от имени группы] (id 501)" in an.r.line(cache.message(1))
+    assert "Модератор [бот] (id 502)" in an.r.line(cache.message(3))
+    assert " Модератор [бот]: я бот" in an.r.compact_line(cache.message(3))
     # имена: от Telethon — никогда для контактов и никогда поверх известного; бот пишет как есть
     from telegram import User as BotUser
     from levbush.normalize import ptb_user_row, tt_user_row
@@ -466,3 +468,13 @@ def test_bidi_close():
 def test_md_ranges():
     out = md_to_tg("шутка [→](msg:253580‑253581), команда `/stats`", {"id": CHAT})
     assert 'href="https://t.me/c/1234567890/253580"' in out and "<code>/stats</code>" in out
+
+
+def test_invisible_name(tmp_path):
+    from levbush.render import Renderer, visible
+    assert not visible("️" * 9) and not visible("ㅤ") and visible("ㅤа̀dmin") and visible("🐸")
+    cfg = Config()
+    cfg.data_dir = tmp_path
+    cache = Cache(tmp_path / "c.db")
+    cache.upsert_user({"id": 9, "first_name": "️" * 9, "username": "yMep"})
+    assert Renderer(cache, cfg).name(9) == "yMep (@yMep)"

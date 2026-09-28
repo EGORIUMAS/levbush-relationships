@@ -1,10 +1,13 @@
 -- Функции API (контракт — docs/api.md). Вызывают Edge Function (service_role), бот и `levbush web`.
 -- Проверка доступа — снаружи; сами функции доступны только service_role и владельцу.
 
+-- имя из одних невидимых символов (селекторы вариантов, заполнители хангыля, пробелы) → ник, как в render.visible
 create or replace function person_name(p people) returns text
 language sql immutable as $$
-    select coalesce(nullif(trim(coalesce(p.first_name, '') || ' ' || coalesce(p.last_name, '')), ''),
-                    p.username, 'id' || p.id::text)
+    select case when regexp_replace(n, '[[:space:]\u00AD\u034F\u115F\u1160\u180B-\u180F\u200B-\u200F'
+                                     '\u202A-\u202E\u2060-\u206F\u2800\u3164\uFE00-\uFE0F\uFEFF\uFFA0]', '', 'g') <> ''
+                then n else coalesce(p.username, 'id' || p.id::text) end
+    from (select trim(coalesce(p.first_name, '') || ' ' || coalesce(p.last_name, '')) as n) x
 $$;
 
 create or replace function api_group() returns jsonb
