@@ -248,6 +248,12 @@ class LLMManager:
                 log.info("vLLM-Qwen разбужен")
             self.slept_qwen = False
 
+    async def restart(self):
+        """Перезапуск зависшего сервера, не отпуская пользователей (они внутри use())."""
+        async with self._lock:
+            subprocess.run(["systemctl", "--user", "stop", self.unit], capture_output=True)
+            await self._start()
+
     async def _idle_watch(self):
         while True:
             await asyncio.sleep(30)

@@ -103,6 +103,8 @@ Parakeet — в квадратных скобках после «расшифр�
 кто в кадре (внешность, эмоции, жесты — только если есть изображение); если это мем или стикер — что он выражает.
 Для голосовых, кружков и видео со звуком: тон и эмоции голоса (пол говорящего не угадывай), смех, музыка, фон, к кому
 обращаются; содержание речи уже есть в расшифровке — не пересказывай её, но можешь пояснить, к чему она относится."""
+DESCRIBE_TIMEOUT = 240     # с на одно вложение
+DESCRIBE_BATCH = 40
 DESCRIBE_KIND = {"voice": "голосовое — ТОЛЬКО ЗВУК, изображения нет, ничего не пиши про кадр и внешность",
                  "audio": "аудиофайл — только звук", "video_note": "кружок (видео со звуком, фронтальная камера)",
                  "video": "видео", "gif": "GIF — анимация без звука", "document": "файл (видео или звук)"}
@@ -286,9 +288,11 @@ class Analyzer:
         if report:
             await self._progress(stage="описание звука и видео (Nemotron)", done=0, total=len(rows), eta=None)
         async with self.mgr.use():
-            llm = L.LLM(self.mgr.url, self.mgr.model or SERVED_NEMOTRON)
+            # таймаут на одно вложение: Nemotron иногда виснет (GPU 100 %, генерация 0) — тогда без него ждали бы 30 мин
+            llm = L.LLM(self.mgr.url, self.mgr.model or SERVED_NEMOTRON, timeout=DESCRIBE_TIMEOUT)
             sem = asyncio.Semaphore(self.cfg.llm_parallel)
             last_report = 0.0
+            timeouts = []
 
             async def one(m):
                 nonlocal done, last_report
@@ -302,21 +306,43 @@ class Analyzer:
                     t = time.time()
                     try:
                         text = await llm.chat([{"role": "user", "content": content}], None, max_tokens=400,
-                                              temperature=0.2, think=False, retries=1)
+                                              temperature=0.2, think=False, retries=0)
                         self.cache.set_media_desc(m["id"], text, "nemotron")
                     except L.LLMError as exc:
                         log.warning("описание #%s: %s", m["id"], str(exc)[:300])
                         if "HTTP 400" in str(exc):   # Nemotron такое не принимает (звук > 600 с и т.п.) — не повторять
                             self.cache.set_media_desc(m["id"], "", "error")
+                        else:
+                            if "Timeout" in str(exc):          # завис на этом вложении — не повторять
+                                self.cache.set_media_desc(m["id"], "", "timeout")
+                            timeouts.append(m["id"])         # после пачки — проверить сервер
                     durations.append((time.time() - t) / self.cfg.llm_parallel)
                 done += 1
                 if report and time.monotonic() - last_report > 20:
                     last_report = time.monotonic()
                     await self._progress(done=done, eta=self._eta(durations, len(rows) - done))
 
-            await asyncio.gather(*(one(m) for m in rows))
+            for k in range(0, len(rows), DESCRIBE_BATCH):
+                await asyncio.gather(*(one(m) for m in rows[k:k + DESCRIBE_BATCH]))
+                if timeouts:
+                    log.warning("Nemotron не справился с вложениями %s — проверяю сервер", timeouts)
+                    timeouts.clear()
+                    if not await self._alive(llm):
+                        await self._say("⚠️ Nemotron завис — перезапускаю")
+                        await self.mgr.restart()
+                        llm = L.LLM(self.mgr.url, self.mgr.model or SERVED_NEMOTRON, timeout=DESCRIBE_TIMEOUT)
         log.info("описано вложений: %d за %.0f с", done, time.time() - t0)
         return done
+
+    @staticmethod
+    async def _alive(llm: L.LLM) -> bool:
+        """Сервер отвечает на короткий текстовый запрос за 60 с."""
+        probe = L.LLM(llm.base, llm.model, timeout=60)
+        try:
+            await probe.chat([{"role": "user", "content": "Ответь одним словом: да"}], None, max_tokens=5, retries=0)
+            return True
+        except L.LLMError:
+            return False
 
     # ================================================================ окна и шаги
 

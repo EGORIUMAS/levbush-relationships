@@ -103,4 +103,4 @@ class LLM:
                 if isinstance(exc, LLMError) and "HTTP 400" in str(exc):
                     break
                 await asyncio.sleep(3 * (attempt + 1))
-        raise LLMError(str(last))
+        raise LLMError(str(last) if isinstance(last, LLMError) else f"{type(last).__name__}: {last}")

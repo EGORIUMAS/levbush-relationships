@@ -83,7 +83,8 @@ class Levbush:
                      if config.qwen_model_path else None)
         if self.qwen:
             self.mgr.peers, self.qwen.peers = [self.qwen], [self.mgr]
-        self.progress_msg = None                  # сообщение админу с прогрессом разбора
+        self.progress_msg = None                  # последнее сообщение админу о разборе — в нём прогресс
+        self.progress_base = ""                   # его текст без блока прогресса
         self.progress_edit = 0.0
         self.analyzer: Analyzer | None = None
         self.retell: Retell | None = None
@@ -111,11 +112,19 @@ class Levbush:
         return int(self.cfg.group) if self.cfg.group.lstrip("-").isdigit() else None
 
     async def notify_admin(self, text: str):
-        if self.app and self.cfg.admin_id:
-            try:
-                await self.app.bot.send_message(self.cfg.admin_id, text, disable_web_page_preview=True)
-            except TelegramError as exc:
-                log.warning("админу не отправилось: %s", exc)
+        """Сообщение админу. Пока идёт разбор, внизу — блок прогресса, и дальше обновляется именно это (последнее)
+        сообщение, а не первое: уведомления о моделях не уносят прогресс вверх."""
+        if not (self.app and self.cfg.admin_id):
+            return
+        prog = self.progress_text(self.analyzer.state) if self.analyzer and self.analyzer.running else ""
+        try:
+            msg = await self.app.bot.send_message(self.cfg.admin_id, esc(text) + (f"\n\n{prog}" if prog else ""),
+                                                  parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except TelegramError as exc:
+            log.warning("админу не отправилось: %s", exc)
+            return
+        if prog:
+            self.progress_msg, self.progress_base, self.progress_edit = msg, esc(text), time.monotonic()
 
     def spawn(self, coro, name: str):
         task = asyncio.create_task(coro, name=name)
@@ -151,7 +160,7 @@ class Levbush:
         return out
 
     async def show_progress(self, st: dict):
-        """Сообщение админу с прогрессом разбора — правится не чаще раза в 30 с."""
+        """Прогресс разбора — в последнем сообщении админу о разборе, правится не чаще раза в 30 с."""
         if not self.app or not self.cfg.admin_id:
             return
         text = self.progress_text(st)
@@ -163,11 +172,14 @@ class Levbush:
         if self.progress_msg is not None and not stage_changed and now - self.progress_edit < 30:
             return
         self.progress_edit, self._progress_stage = now, st.get("stage")
+        base = self.progress_base if self.progress_msg is not None else ""
+        body = (base + "\n\n" if base else "") + text
         try:
             if self.progress_msg is None:
-                self.progress_msg = await self.app.bot.send_message(self.cfg.admin_id, text, parse_mode=ParseMode.HTML)
+                self.progress_msg = await self.app.bot.send_message(self.cfg.admin_id, body, parse_mode=ParseMode.HTML)
+                self.progress_base = ""
             else:
-                await self.progress_msg.edit_text(text, parse_mode=ParseMode.HTML)
+                await self.progress_msg.edit_text(body, parse_mode=ParseMode.HTML)
         except BadRequest as exc:
             if "not modified" not in str(exc).lower():
                 log.warning("прогресс: %s", exc)
