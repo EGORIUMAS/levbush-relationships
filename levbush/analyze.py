@@ -37,39 +37,62 @@ RULES = """Правила:
 - Пиши по-русски, коротко и по делу. Людей называй по имени, в JSON — по id.
 - Голосовые и кружки: содержание бери из расшифровки (Parakeet), по звуку и видео оценивай тон и эмоции."""
 
-def _arr(props: dict) -> dict:
-    return {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": props,
-                                       "required": list(props)}}
+def _arr(props: dict, max_items: int) -> dict:
+    return {"type": "array", "maxItems": max_items,
+            "items": {"type": "object", "additionalProperties": False, "properties": props, "required": list(props)}}
 
 
-_INT, _STR, _BOOL = {"type": "integer"}, {"type": "string"}, {"type": "boolean"}
-_MSGS = {"type": "array", "items": _INT}
+def _str(max_len: int) -> dict:
+    return {"type": "string", "maxLength": max_len}
 
-# Ответ шага — пачка правок (как вызовы инструментов), а не переписанные досье
-STEP_SCHEMA = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "windows": _arr({"id": _INT, "summary": _STR, "topics": {"type": "array", "items": _STR}, "mood": _STR}),
-        "add": _arr({"person": _INT, "section": {"type": "string", "enum": list(SECTIONS)}, "text": _STR,
-                     "msgs": _MSGS, "certain": _BOOL}),
-        "update": _arr({"person": _INT, "entry": _STR, "text": _STR, "msgs": _MSGS, "why": _STR}),
-        "remove": _arr({"person": _INT, "entry": _STR, "msgs": _MSGS, "why": _STR}),
-        "summaries": _arr({"person": _INT, "text": _STR}),
-        "names": _arr({"person": _INT, "name": _STR}),
-        "relations": _arr({"a": _INT, "b": _INT, "kind": _STR, "tone": _STR,
-                           "closeness": {"type": "integer", "minimum": 0, "maximum": 10}, "summary": _STR}),
-        "relation_events": _arr({"a": _INT, "b": _INT, "text": _STR, "msgs": _MSGS}),
-        "relation_notes": _arr({"a": _INT, "b": _INT, "section": {"type": "string", "enum": list(REL_NOTES)},
-                                "text": _STR, "msgs": _MSGS}),
-    },
-    "required": ["windows", "add", "update", "remove", "summaries", "names", "relations", "relation_events",
-                 "relation_notes"],
-}
+
+def _enum(values) -> dict:
+    return {"type": "integer", "enum": sorted(set(values))} if values else {"type": "integer"}
+
+
+def step_schema(windows: list[int], people: list[int], others: list[int], entries: list[str],
+                msgs: list[int]) -> dict:
+    """Схема ответа шага. Допустимые значения зашиты в enum: id людей шага, id существующих записей, номера
+    сообщений окон — иначе модель подставляет id людей вместо сообщений и выдумывает id записей.
+    people — с показанными досье (любые правки), others — остальные (add, names, связи)."""
+    everyone = list(people) + list(others)
+    anyone, shown = _enum(everyone), _enum(people)
+    refs = {"type": "array", "maxItems": 6, "items": _enum(msgs)}
+    props = {
+        "windows": _arr({"id": _enum(windows), "summary": _str(700), "topics": {"type": "array", "maxItems": 6,
+                                                                           "items": _str(60)},
+                         "mood": _str(80)}, len(windows)),
+        "add": _arr({"person": anyone, "section": {"type": "string", "enum": list(SECTIONS)}, "text": _str(300),
+                     "msgs": refs, "certain": {"type": "boolean"}}, 40),
+        "summaries": _arr({"person": shown, "text": _str(160)}, len(people)),
+        "names": _arr({"person": anyone, "name": _str(40)}, 20),
+        "relations": _arr({"a": anyone, "b": anyone, "kind": _str(40), "tone": _str(40),
+                           "closeness": {"type": "integer", "minimum": 0, "maximum": 10}, "summary": _str(160)}, 20),
+        "relation_events": _arr({"a": anyone, "b": anyone, "text": _str(240), "msgs": refs}, 20),
+        "relation_notes": _arr({"a": anyone, "b": anyone, "section": {"type": "string", "enum": list(REL_NOTES)},
+                                "text": _str(400), "msgs": refs}, 15),
+    }
+    if entries:                       # править можно только то, что показано
+        entry = {"type": "string", "enum": sorted(set(entries))}
+        props["update"] = _arr({"person": shown, "entry": entry, "text": _str(300), "msgs": refs, "why": _str(160)}, 20)
+        props["remove"] = _arr({"person": shown, "entry": entry, "msgs": refs, "why": _str(160)}, 15)
+    return {"type": "object", "additionalProperties": False, "properties": props, "required": list(props)}
+
+
+STEP_FORMAT = """Формат ответа — JSON (схема задана сервером), пример:
+{"windows": [{"id": 253554, "summary": "…", "topics": ["…"], "mood": "…"}],
+ "add": [{"person": 5336970023, "section": "facts", "text": "учится в МГУ", "msgs": [253560], "certain": true}],
+ "update": [{"person": 5336970023, "entry": "e3", "text": "перевёлся в ВШЭ", "msgs": [253571], "why": "перевёлся"}],
+ "remove": [], "summaries": [], "names": [{"person": 5336970023, "name": "Лёва"}],
+ "relations": [{"a": 1, "b": 2, "kind": "дружба", "tone": "тёплый", "closeness": 7, "summary": "…"}],
+ "relation_events": [{"a": 1, "b": 2, "text": "…", "msgs": [253575]}], "relation_notes": []}
+person, a, b — id людей; msgs — номера сообщений (#253560 → 253560), НЕ id людей; entry — id записи из досье
+(вида e3). Запись — вывод о человеке своими словами, а не цитата сообщения и не его имя. Пустые списки — нормально,
+но обычно в окне есть что записать: кто где живёт, учится, работает, чем увлекается, что планирует, как себя ведёт,
+кто с кем шутит, спорит, флиртует, кто кого поддерживает. Все тексты в JSON — ТОЛЬКО на русском языке."""
+
 
 CHARS_PER_TOKEN = 2.8     # грубая оценка для русского текста
-
-def _schema_hint(schema) -> str:
-    return "Ответ — строго один JSON-объект по схеме:\n" + json.dumps(schema, ensure_ascii=False)
 
 
 def _dt(ts_: int, cfg: Config) -> str:
@@ -500,7 +523,9 @@ class Analyzer:
             "- summaries — одна строка до 140 знаков «кто это в группе», если прежней нет или она устарела.\n"
             "- names — как называют человека в чате: настоящее имя (если имя в профиле — действительно имя, а не "
             "слово вроде «Кто-то»), уменьшительные, прозвища, неправильные падежные формы вроде «Льва», если этого "
-            "ещё нет в «Как называют». Только то, что однозначно указывает на этого человека, — не общие слова. По "
+            "ещё нет в «Как называют». Только то, что однозначно указывает на этого человека, — не общие слова. "
+            "Ник и имя из профиля дословно не повторяй (они и так известны), а производные от них — нужны: "
+            "«Магор» от «Magor Gûl», «Лёва» от «Лев». По "
             "этим именам его потом узнают, когда о нём говорят заочно. Можно для любого человека группы.\n"
             "- relations — для пар (a < b), чья связь проявилась в новых окнах и у которых что-то новое: kind "
             "(дружба, флирт, пара, соперничество, коллеги, перепалки, знакомые…), tone, closeness 0–10 (сила и "
@@ -508,28 +533,33 @@ class Analyzer:
             "- relation_events — заметное событие между двумя людьми (помогли, поссорились, договорились, "
             "флиртовали, поздравили…), одной фразой.\n"
             "- relation_notes — заменить заметку о связи: section how (как общаются), bond (что их связывает), "
-            "dynamics (к чему идёт) — 1–3 предложения.\n" + _schema_hint(STEP_SCHEMA))
+            "dynamics (к чему идёт) — 1–3 предложения.\n" + STEP_FORMAT)
+        entry_ids = [e["id"] for uid in people for e in dossiers[uid]["entries"] if not e["removed"]]
+        msg_ids = [m["id"] for m in msgs]
+        schema = step_schema([w.id for w in new], people, roster_ids, entry_ids, msg_ids)
         budget = self.media.budget(self.cfg.step_tokens)
         blocks = [(f"=== Окно #{w.id}, {self._span(w)} ===", w.msgs) for w in new]
         content = [L.text(head)] + self.interleave(blocks, budget) + [L.text(task)]
         chars = sum(len(p["text"]) for p in content if p["type"] == "text")
         media_tokens = self.cfg.step_tokens - budget.tokens
         est = int(chars / CHARS_PER_TOKEN) + media_tokens
-        room = self.cfg.llm_ctx - est - 1000
+        room = self.cfg.llm_ctx - est - 1000 - (self.cfg.llm_think_budget if self.cfg.llm_think else 0)
         if room < 6000 and last - first > 1:
             raise _TooBig()
-        max_tokens = max(4000, min(32000, room))
+        max_tokens = max(4000, min(12000, room))      # правки — не романы; зацикливание обрывается раньше
         try:
-            out = await self.llm.chat([{"role": "user", "content": content}], STEP_SCHEMA, max_tokens=max_tokens,
-                                      think=self.cfg.llm_think, audio_in_video=budget.audio_in_video)
+            out = await self.llm.chat([{"role": "user", "content": content}], schema, max_tokens=max_tokens,
+                                      think=self.cfg.llm_think, think_budget=self.cfg.llm_think_budget,
+                                      audio_in_video=budget.audio_in_video)
         except L.LLMError as exc:
             if last - first > 1:
                 raise _TooBig() from exc
             if media_tokens:
                 log.warning("окно #%s с вложениями не прошло (%s) — повторяю без вложений", new[0].id, exc)
                 text_only = head + "\n\n" + "\n\n".join(f"{h}\n{self._text(w)}" for (h, _), w in zip(blocks, new))
-                out = await self.llm.chat([{"role": "user", "content": text_only + "\n\n" + task}], STEP_SCHEMA,
-                                          max_tokens=max_tokens, think=self.cfg.llm_think)
+                out = await self.llm.chat([{"role": "user", "content": text_only + "\n\n" + task}], schema,
+                                          max_tokens=max_tokens, think=self.cfg.llm_think,
+                                          think_budget=self.cfg.llm_think_budget)
             else:
                 raise
         log.info("шаг #%s: оценка %d ток., медиа %d ток., не влезло вложений %d", new[0].id, est, media_tokens,
@@ -546,6 +576,16 @@ class Analyzer:
             when = datetime.fromtimestamp(min(dates), self.cfg.tz) if dates else fallback.astimezone(self.cfg.tz)
             return when.strftime("%Y-%m-%d")
         return day
+
+    def _is_profile_name(self, uid, name) -> bool:
+        """Совпадает ли name дословно (без регистра, эмодзи и знаков) с ником или именем из профиля."""
+        u = self.cache.user(uid) if uid else None
+        if u is None or not name:
+            return False
+        def clean(x):
+            return " ".join(re.findall(r"[^\W_]+", norm_name(x or "")))
+        full = " ".join(x for x in (u["first_name"], u["last_name"]) if x)
+        return clean(name) in {clean(u["username"]), clean(u["first_name"]), clean(u["last_name"]), clean(full)} - {""}
 
     async def _apply(self, out: dict, new: list[Episode], people: set, roster: set, as_of: datetime, dossiers: dict,
                      rels: dict):
@@ -573,6 +613,8 @@ class Analyzer:
             if apply_person(data, only_add, uid, day):
                 await self.db.save_dossier(uid, as_of, data.get("summary") or None, render_person(data, self.chat), data)
                 self.stat["dossiers"] += 1
+        # «Как называют»: дословный ник или имя профиля не нужны — они и так известны
+        out["names"] = [o for o in out.get("names", []) if not self._is_profile_name(o.get("person"), o.get("name"))]
         if out.get("names") and self._names is not None:
             for o in out["names"]:
                 if o.get("person") in allowed_names and o.get("name"):

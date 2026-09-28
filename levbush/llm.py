@@ -55,9 +55,16 @@ class LLM:
         self._schema_ok = True
 
     async def chat(self, messages, schema: dict | None = None, *, max_tokens: int = 4096, temperature: float = 0.3,
-                   think: bool = False, audio_in_video: bool = False, retries: int = 2):
-        body = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
-                "chat_template_kwargs": {"enable_thinking": think}}
+                   think: bool = False, think_budget: int = 0, audio_in_video: bool = False, retries: int = 2):
+        """think_budget — сколько токенов модель может рассуждать; max_tokens — на сам ответ (бюджет добавляется)."""
+        body = {"model": self.model, "messages": messages, "temperature": temperature,
+                "max_tokens": max_tokens + (think_budget if think else 0),
+                "chat_template_kwargs": {"enable_thinking": think},
+                "repetition_penalty": 1.05}   # против зацикливания; пробелы в JSON запрещены на сервере
+        if think and think_budget:
+            # мягко — подсказкой в шаблоне модели, жёстко — ограничением vLLM (потом рассуждение закрывается)
+            body["chat_template_kwargs"]["reasoning_budget"] = think_budget
+            body["thinking_token_budget"] = think_budget
         if audio_in_video:
             body["mm_processor_kwargs"] = {"use_audio_in_video": True}
         if schema is not None and self._schema_ok:
@@ -78,8 +85,9 @@ class LLM:
                 choice = r.json()["choices"][0]
                 content = choice["message"].get("content") or ""
                 if choice.get("finish_reason") == "length" and schema is not None:
-                    body["max_tokens"] = int(body["max_tokens"] * 1.8)
-                    raise LLMError("ответ обрезан по max_tokens")
+                    # почти всегда это зацикливание: повторяем холоднее, лимит не раздуваем
+                    body["temperature"] = max(0.0, body["temperature"] - 0.2)
+                    raise LLMError("ответ обрезан по max_tokens (зацикливание?)")
                 return parse_json(content) if schema is not None else content.strip()
             except (httpx.HTTPError, LLMError, KeyError) as exc:
                 last = exc

@@ -120,6 +120,7 @@ class Retell:
         content.append(L.text(PROMPT.format(title=title, start=start, end=end, limit=limit_chars)))
         try:
             return await self.a.llm.chat([{"role": "user", "content": content}], max_tokens=4000,
+                                         think=self.cfg.llm_think, think_budget=self.cfg.llm_think_budget,
                                          audio_in_video=budget.audio_in_video)
         except L.LLMError as exc:
             log.warning("пересказ с вложениями не прошёл (%s) — без вложений", exc)

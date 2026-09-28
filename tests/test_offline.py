@@ -397,3 +397,12 @@ def test_name_mentions(env):
                                    {"person": 2, "name": "чужое"}]}, 1, lambda m: "2025-01-01")
     assert n == 1 and d["names"] == ["Лёва"]
     assert prompt_person(d).startswith("Как называют: Лёва") and "**Как называют:** Лёва" in render_person(d, {})
+
+
+def test_profile_name_filter(env):
+    cfg, cache = env
+    an = Analyzer(cfg, cache, db=None, mgr=None)
+    cache.upsert_user({"id": 555, "first_name": "Magor Gûl", "username": "levbush"})
+    assert an._is_profile_name(555, "Magor Gûl") and an._is_profile_name(555, "levbush")
+    assert an._is_profile_name(555, "magor gûl 🇷🇺")          # регистр и эмодзи не спасают дословный повтор
+    assert not an._is_profile_name(555, "Магор") and not an._is_profile_name(555, "Лёва")

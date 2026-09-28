@@ -97,7 +97,8 @@ class Config:
     llm_parallel: int = field(default_factory=lambda: env_int("LLM_PARALLEL", 4))  # одновременных запросов на медиа
     llm_idle_stop_min: int = field(default_factory=lambda: env_int("LLM_IDLE_STOP_MIN", 15))
     llm_need_gib: float = field(default_factory=lambda: env_float("LLM_NEED_GIB", 28.0))
-    llm_think: bool = field(default_factory=lambda: env_bool("LLM_THINK", False))
+    llm_think: bool = field(default_factory=lambda: env_bool("LLM_THINK", True))             # рассуждение Nemotron
+    llm_think_budget: int = field(default_factory=lambda: env_int("LLM_THINK_BUDGET", 8192))  # токенов на рассуждение
     fallback_llm_url: str = field(default_factory=lambda: env("FALLBACK_LLM_URL", "http://127.0.0.1:8080").rstrip("/"))
     qwen_port: int = field(default_factory=lambda: env_int("QWEN_PORT", 18081))
     # шаг разбора: несколько последовательных окон + контекст + текущие досье и связи

@@ -131,6 +131,8 @@ class LLMManager:
                                                        "num_frames": self.cfg.video_max_frames}}),
             "--limit-mm-per-prompt", json.dumps({"image": self.cfg.mm_images, "video": self.cfg.mm_videos,
                                                  "audio": self.cfg.mm_audio}),
+            # без этого штраф за повторы гонит модель в пробелы между токенами JSON
+            "--structured-outputs-config", json.dumps({"backend": "xgrammar", "disable_any_whitespace": True}),
             "--enable-prefix-caching", "--reasoning-parser", "nemotron_v3",
             "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder",
         ]
