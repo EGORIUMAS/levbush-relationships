@@ -164,6 +164,9 @@ class Levbush:
             log.error("Telethon: %s", exc)
             await self.notify_admin(f"⚠️ Telethon не подключён: {exc}\nИстория и медиа не качаются, "
                                     f"бот собирает только новые сообщения.")
+        skipped, removed = self.cache.skip_unwanted_media()
+        if skipped:
+            log.info("вложения, которые нейросеть не примет: сняты с очереди %d, удалено файлов %d", skipped, removed)
         self.analyzer = Analyzer(self.cfg, self.cache, self.db, self.mgr, notify=self.notify_admin)
         self.retell = Retell(self.analyzer)
         await app.bot.set_my_commands([

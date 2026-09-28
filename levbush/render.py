@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .cache import Cache
 from .config import Config
+from .normalize import TEXT_EXT
 
 MEDIA_RU = {"photo": "фото", "video": "видео", "video_note": "кружок", "voice": "голосовое", "audio": "аудио",
             "gif": "GIF", "document": "файл", "sticker": "стикер", "poll": "опрос", "location": "геопозиция",
@@ -28,8 +29,6 @@ def link_msgs(markdown: str, chat: dict) -> str:
     return markdown
 
 
-TEXT_EXT = {".txt", ".md", ".py", ".json", ".csv", ".log", ".yaml", ".yml", ".ini", ".cfg", ".html", ".xml", ".js",
-            ".ts", ".c", ".cpp", ".h", ".java", ".go", ".rs", ".sh", ".sql", ".tex", ".srt", ".vtt"}
 
 
 def file_text(path: str, meta: dict, limit: int = 6000) -> str | None:

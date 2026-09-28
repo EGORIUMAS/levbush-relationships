@@ -205,6 +205,23 @@ class Cache:
         return self.db.execute("select * from messages where date >= ? and date < ? and not deleted order by date, id",
                                (t0, t1)).fetchall()
 
+    def skip_unwanted_media(self) -> tuple[int, int]:
+        """Вложения, которые нейросеть не примет (.tgs, zip/docx/…), — в skip; уже скачанные удаляются.
+        Возвращает (сколько снято с очереди, сколько файлов удалено)."""
+        from .normalize import wanted
+        skipped = removed = 0
+        rows = self.db.execute("select id, media, media_meta, media_state, media_path from messages "
+                               "where media_state in ('pending', 'ok', 'error')").fetchall()
+        for r in rows:
+            if wanted(r["media"], json.loads(r["media_meta"]) if r["media_meta"] else {}):
+                continue
+            if r["media_path"] and Path(r["media_path"]).exists():
+                Path(r["media_path"]).unlink()
+                removed += 1
+            self.db.execute("update messages set media_state = 'skip', media_path = null where id = ?", (r["id"],))
+            skipped += 1
+        return skipped, removed
+
     def set_media(self, msg_id: int, state: str, path: str | None = None):
         self.db.execute("update messages set media_state = ?, media_path = coalesce(?, media_path) where id = ?",
                         (state, path, msg_id))

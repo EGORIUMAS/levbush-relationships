@@ -182,12 +182,31 @@ def from_telethon(msg, chat_id: int, channel_id: int | None) -> dict:
     kind, meta = tt_media(msg)
     if kind:
         row["media"], row["media_meta"] = kind, meta
-        row["media_state"] = "pending" if kind in DOWNLOADABLE else None
+        row["media_state"] = "pending" if wanted(kind, meta) else None
     return row
 
 
 # медиа, которые скачиваем (для нейросети и расшифровки)
 DOWNLOADABLE = {"photo", "video", "video_note", "voice", "audio", "gif", "document", "sticker"}
+TEXT_EXT = {".txt", ".md", ".py", ".json", ".csv", ".log", ".yaml", ".yml", ".ini", ".cfg", ".html", ".xml", ".js",
+            ".ts", ".c", ".cpp", ".h", ".java", ".go", ".rs", ".sh", ".sql", ".tex", ".srt", ".vtt"}
+
+
+def wanted(kind, meta) -> bool:
+    """Качать ли вложение: только то, что Nemotron примет (или Parakeet расшифрует).
+    Не качаются анимированные стикеры .tgs (Lottie) и документы, кроме PDF, картинок/видео/аудио и текстовых."""
+    if kind not in DOWNLOADABLE:
+        return False
+    meta = meta or {}
+    mime = meta.get("mime") or ""
+    if kind == "sticker":
+        return mime != "application/x-tgsticker"
+    if kind == "document":
+        name = (meta.get("file_name") or "").lower()
+        ext = name[name.rfind("."):] if "." in name else ""
+        return (mime == "application/pdf" or ext == ".pdf" or mime.startswith(("image/", "video/", "audio/", "text/"))
+                or ext in TEXT_EXT)
+    return True
 
 
 def tt_reactions(msg):
@@ -354,7 +373,7 @@ def from_ptb(m) -> dict | None:
     kind, meta = ptb_media(m)
     if kind:
         row["media"], row["media_meta"] = kind, meta
-        row["media_state"] = "pending" if kind in DOWNLOADABLE else None
+        row["media_state"] = "pending" if wanted(kind, meta) else None
     return row
 
 

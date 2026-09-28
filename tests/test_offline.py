@@ -406,3 +406,15 @@ def test_profile_name_filter(env):
     assert an._is_profile_name(555, "Magor Gûl") and an._is_profile_name(555, "levbush")
     assert an._is_profile_name(555, "magor gûl 🇷🇺")          # регистр и эмодзи не спасают дословный повтор
     assert not an._is_profile_name(555, "Магор") and not an._is_profile_name(555, "Лёва")
+
+
+def test_wanted_media():
+    from levbush.normalize import wanted
+    assert wanted("photo", {}) and wanted("voice", {}) and wanted("sticker", {"mime": "image/webp"})
+    assert not wanted("sticker", {"mime": "application/x-tgsticker"})
+    assert wanted("document", {"mime": "application/pdf"}) and wanted("document", {"file_name": "notes.TXT"})
+    assert wanted("document", {"mime": "video/mp4"}) and wanted("document", {"mime": "image/png"})
+    for bad in ({"file_name": "a.zip"}, {"file_name": "x.docx"}, {"mime": "application/octet-stream"},
+                {"file_name": "app.apk", "mime": "application/vnd.android.package-archive"}):
+        assert not wanted("document", bad)
+    assert not wanted("poll", {}) and not wanted("webpage", {})
