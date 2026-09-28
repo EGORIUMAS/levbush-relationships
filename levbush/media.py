@@ -3,7 +3,9 @@
 Отдельно готовятся только то, чего модель не принимает напрямую:
 - PDF → страницы PNG; текстовые файлы → их текст (в самой переписке, см. render.py);
 - звук в контейнере, который не читает libsndfile (m4a/aac…), → wav;
-- видео без звуковой дорожки (GIF, немое) → несколько кадров: флаг use_audio_in_video общий на запрос.
+- у видео со звуком дорожка идёт отдельным звуком сразу после видео: режим use_audio_in_video в vLLM требует,
+  чтобы звуков в запросе было ровно столько же, сколько видео, и ломается от любого отдельного голосового;
+- видео без звуковой дорожки (GIF, немое) → несколько кадров.
 Речь дополнительно расшифровывает Parakeet (Nemotron понимает только английскую речь) — текст в переписке.
 """
 import json
@@ -59,15 +61,31 @@ class Media:
         return out
 
     def _frames(self, src: str, msg_id: int, duration: float, n: int = 3) -> list[Path]:
-        out = []
-        for i in range(n):
-            at = max(0.0, (duration or 1) * (i + 0.5) / n)
-            p = self.conv / f"{msg_id}-f{i}.jpg"
-            if not p.exists():
-                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{at:.2f}", "-i", src, "-frames:v", "1", str(p)],
-                               capture_output=True)
-            if p.exists():
-                out.append(p)
+        """n кадров из видео. Видеостикеры Telegram (webm, VP9 с прозрачностью) приходят с неверным цветовым
+        пространством и почти нулевой длительностью в метаданных — их сначала перепаковываем (vp9_metadata)."""
+        dec, ext = [], "jpg"
+        if src.endswith(".webm"):
+            fixed = self.conv / f"{msg_id}.fix.webm"
+            if not fixed.exists():
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", src, "-c", "copy", "-bsf:v",
+                                "vp9_metadata=color_space=bt709", str(fixed)], capture_output=True)
+            src = str(fixed) if fixed.exists() else src
+            dec, ext = ["-c:v", "libvpx-vp9"], "png"        # libvpx сохраняет альфа-канал
+        out = sorted(self.conv.glob(f"{msg_id}-f*.{ext}"))
+        if out:
+            return out
+        if duration and duration >= 1:
+            for i in range(n):
+                at = max(0.0, duration * (i + 0.5) / n)
+                p = self.conv / f"{msg_id}-f{i}.{ext}"
+                subprocess.run(["ffmpeg", "-v", "error", "-y", *dec, "-ss", f"{at:.2f}", "-i", src, "-frames:v", "1",
+                                str(p)], capture_output=True)
+                if p.exists():
+                    out.append(p)
+        if not out:                                           # длительность неизвестна — кадр в секунду
+            subprocess.run(["ffmpeg", "-v", "error", "-y", *dec, "-i", src, "-vf", "fps=1", "-frames:v", str(n),
+                            str(self.conv / f"{msg_id}-f%d.{ext}")], capture_output=True)
+            out = sorted(self.conv.glob(f"{msg_id}-f*.{ext}"))
         return out
 
     def _pdf_pages(self, path: str, msg_id: int) -> list[Path]:
@@ -132,13 +150,14 @@ class Media:
                 # немое видео и слишком длинное — кадрами (звук длинного — в расшифровке)
                 return images(self._frames(path, m["id"], dur))
             frames = min(cfg.video_max_frames, max(1, int(dur * cfg.video_fps)))
-            cost = frames * cfg.tok_video_frame + int(dur * cfg.tok_audio_sec)
-            if budget.video < 1 or cost > budget.tokens:
+            cost = frames * cfg.tok_video_frame + int(dur * cfg.tok_audio_sec) + 50
+            wav = self._wav(path, m["id"]) if budget.audio >= 1 else None
+            if budget.video < 1 or wav is None or cost > budget.tokens:
                 return images(self._frames(path, m["id"], dur))
             budget.video -= 1
+            budget.audio -= 1
             budget.tokens -= cost
-            budget.audio_in_video = True
-            return [L.text(label), L.video(path)]
+            return [L.text(label), L.video(path), L.text(f"Звук из #{m['id']}:"), L.audio(wav)]
         return []
 
     def cost(self, m) -> int:

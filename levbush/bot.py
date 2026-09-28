@@ -328,6 +328,11 @@ class Levbush:
         if self.initiated and not self.busy("ежедневный разбор"):
             self.spawn(self.daily(), "ежедневный разбор")
 
+    @property
+    def analysis_started(self) -> bool:
+        """Первый прогон нейросетью запускает только админ (/analyze или кнопка); до этого — без разбора."""
+        return bool(self.cache.get("analysis_started"))
+
     async def daily(self):
         if self.tg_ok:
             await self.tg.sync_history()
@@ -342,7 +347,10 @@ class Levbush:
                 pass
         self.dirty = True
         await self.push_stats(force=True)
-        await self.analyzer.run("daily")
+        if self.analysis_started:
+            await self.analyzer.run("daily")
+        else:
+            log.info("ежедневный разбор пропущен: первый прогон ещё не запускали (/analyze)")
 
     # ================================================================ сбор
 
@@ -788,6 +796,7 @@ class Levbush:
         if self.analyzer.running:
             await self.reply(update, "Разбор уже идёт — /status.")
             return
+        self.cache.set("analysis_started", int(time.time()))
         self.spawn(self.analyzer.run("вручную"), "разбор")
         await self.reply(update, "🧠 Запустил разбор. Прогресс — /status и на карте.")
 
@@ -855,6 +864,7 @@ class Levbush:
                 await q.message.reply_text(await self.links_text(int(rest)), parse_mode=ParseMode.HTML)
             elif kind == "an" and self.is_admin(update):
                 if rest == "run" and not self.analyzer.running:
+                    self.cache.set("analysis_started", int(time.time()))
                     self.spawn(self.analyzer.run("первый прогон"), "разбор")
                     await q.edit_message_text(q.message.text + "\n\n🧠 Разбор запущен. Прогресс — /status.")
                 else:

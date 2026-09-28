@@ -146,9 +146,10 @@ def test_interleave_media(env):
     budget = an.media.budget(10 ** 6)
     parts = an.interleave([(f"=== Окно #{w.id} ===", w.msgs) for w in wins[:2]], budget)
     kinds = [p["type"] for p in parts]
-    assert kinds.count("image_url") >= 1 + 3 + 1       # фото, 3 кадра немого GIF, страница PDF
-    assert kinds.count("audio_url") == 1 and kinds.count("video_url") == 1
-    assert budget.audio_in_video
+    assert kinds.count("image_url") >= 1 + 1 + 1       # фото, кадры немого GIF, страница PDF
+    # голосовое + звук кружка отдельной дорожкой (use_audio_in_video не используется: ломается от голосовых)
+    assert kinds.count("audio_url") == 2 and kinds.count("video_url") == 1
+    assert not budget.audio_in_video
     text = "\n".join(p["text"] for p in parts if p["type"] == "text")
     assert "расшифровка: «привет это голосовое»" in text
     assert "текст файла:\nсписок покупок" in text
@@ -226,7 +227,7 @@ def test_step(env):
     content = messages[0]["content"]
     text = "\n".join(p["text"] for p in content if p["type"] == "text")
     assert "## Новые окна переписки" in text and "Досье пока нет" in text and "Верни только ПРАВКИ" in text
-    assert kw["audio_in_video"] is True and "add" in schema["properties"]
+    assert kw["audio_in_video"] is False and "add" in schema["properties"]
     kinds = [x[0] for x in db.saved]
     assert kinds.count("dossier") == 2 and kinds.count("relation") == 1 and ("episode", 1) in db.saved
     assert "## Остальные люди группы" in text and "Гоша (@gosha), id 104" in text

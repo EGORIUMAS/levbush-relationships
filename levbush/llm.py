@@ -30,6 +30,13 @@ class LLMError(RuntimeError):
     pass
 
 
+def _short_error(text: str) -> str:
+    """Ошибка vLLM без дампа входных данных (массивы звука, промпт): начало и хвост, где причина."""
+    text = re.sub(r"array\(\[.*?\](, shape=\([^)]*\))?(, dtype=\w+)?\)", "array(…)", text, flags=re.S)
+    text = re.sub(r"'text': '.*?', '", "'text': '…', '", text, flags=re.S)
+    return text if len(text) <= 1200 else text[:400] + " … " + text[-800:]
+
+
 def parse_json(raw: str):
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
@@ -81,7 +88,7 @@ class LLM:
                     body.pop("response_format")
                     continue
                 if r.status_code >= 400:
-                    raise LLMError(f"HTTP {r.status_code}: {r.text[:500]}")
+                    raise LLMError(f"HTTP {r.status_code}: {_short_error(r.text)}")
                 choice = r.json()["choices"][0]
                 content = choice["message"].get("content") or ""
                 if choice.get("finish_reason") == "length" and schema is not None:
