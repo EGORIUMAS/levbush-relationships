@@ -461,3 +461,8 @@ def test_bidi_close():
     assert bidi_close(nick) == nick + "⁩" and bidi_close("Аня") == "Аня"
     assert bidi_close("a⁧b⁩") == "a⁧b⁩"          # уже закрыт — не трогаем
     assert esc(nick).endswith("⁩")
+
+
+def test_md_ranges():
+    out = md_to_tg("шутка [→](msg:253580‑253581), команда `/stats`", {"id": CHAT})
+    assert 'href="https://t.me/c/1234567890/253580"' in out and "<code>/stats</code>" in out

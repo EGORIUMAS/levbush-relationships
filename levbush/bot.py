@@ -217,6 +217,8 @@ class Levbush:
     async def post_shutdown(self, app: Application):
         for t in list(self.bg):
             t.cancel()
+        if self.mgr._idle_task and not self.mgr._idle_task.done():
+            self.mgr._idle_task.cancel()
         if self.mgr.started_by_us:
             await self.mgr.stop()
         await self.tg.close()
@@ -759,7 +761,19 @@ class Levbush:
                     await self.tg.download_since(since_ts)
                 if not await self.mgr.is_up():
                     await status.edit_text("⏳ Поднимаю Nemotron (~2 мин), потом перескажу…")
-                text = await self.retell.run(since_ts)
+                last = 0.0
+
+                async def progress(done, total):
+                    nonlocal last
+                    if time.monotonic() - last > 5 or done == total:
+                        last = time.monotonic()
+                        try:
+                            await status.edit_text(f"⏳ Пересказываю: часть {done}/{total}" +
+                                                   (" — свожу в один текст…" if done == total else ""))
+                        except TelegramError:
+                            pass
+
+                text = await self.retell.run(since_ts, progress=progress)
             except asyncio.CancelledError:
                 await asyncio.shield(status.edit_text("🔧 Пересказ прерван: бот ушёл на техобслуживание."))
                 raise

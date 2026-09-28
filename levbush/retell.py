@@ -3,6 +3,7 @@
 Nemotron получает переписку с вложениями как есть (фото, видео, кружки, голосовые + расшифровка Parakeet).
 Если всё не влезает в один запрос — пересказ по частям и итоговая сводка.
 """
+import asyncio
 import html
 import logging
 import re
@@ -20,15 +21,17 @@ PROMPT = (
     "пропустил. Сначала итог в 1–2 предложениях, потом по темам в хронологическом порядке: кто что говорил, "
     "предлагал, решил, о чём спорили, чем закончилось, что важного прислали (фото, видео, голосовые — ты видишь и "
     "слышишь их сами; у речи есть расшифровка). Людей называй по имени. На ключевые сообщения ставь ссылки "
-    "[→](msg:123). Пиши живо, по-русски, без воды. Разметка: **жирный**, списки «- », ссылки. Не длиннее {limit} "
+    "[→](msg:123) — на одно сообщение, без диапазонов. Пиши живо, по-русски, без воды. Разметка: **жирный**, списки «- », ссылки. Не длиннее {limit} "
     "знаков.")
 
 
 def md_to_tg(text: str, chat: dict) -> str:
     """Упрощённый Markdown ответа → HTML Telegram."""
     text = html.escape(text, quote=False)
-    text = re.sub(r"\[([^\]]+)\]\(msg:(\d+)\)",
+    # [→](msg:123) и диапазоны [→](msg:123-125) — ссылка на первое сообщение
+    text = re.sub(r"\[([^\]]+)\]\(msg:(\d+)(?:\s*[-‑–—]\s*\d+)?\)",
                   lambda m: f'<a href="{msg_link(chat, int(m.group(2)))}">{m.group(1)}</a>', text)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?m)^#{1,6}\s*(.+)$", r"<b>\1</b>", text)
@@ -72,7 +75,8 @@ class Retell:
             return t
         return None
 
-    async def run(self, since_ts: int, limit_chars: int = 3500) -> str:
+    async def run(self, since_ts: int, limit_chars: int = 3500, progress=None) -> str:
+        """progress(done, total) — чтобы бот показывал «часть 3/12»."""
         now = int(time.time())
         earliest = now - self.cfg.retell_max_hours * 3600
         if since_ts < earliest:
@@ -88,11 +92,11 @@ class Retell:
         title = chat.get("title") or "группа"
         fmt = lambda t: datetime.fromtimestamp(t, self.cfg.tz).strftime("%d.%m %H:%M")  # noqa: E731
 
-        # части по бюджету (текст + медиа)
+        # части по бюджету (текст + медиа); у пересказа части крупнее, чем у разбора: думать почти не нужно
         parts, cur, size = [], [], 0
         for m in rows:
-            n = self.a._msg_tokens(m)
-            if cur and size + n > self.cfg.step_tokens:
+            n = int(len(self.a.r.compact_line(m)) / 2.8) + (self.a.media.cost(m) if m["media"] else 0)
+            if cur and size + n > self.cfg.retell_tokens:
                 parts.append(cur)
                 cur, size = [], 0
             cur.append(m)
@@ -103,29 +107,40 @@ class Retell:
         async with self.a.mgr.use():
             if len(parts) == 1:
                 return md_to_tg(await self._one(parts[0], title, fmt(rows[0]["date"]), fmt(now), limit_chars), chat)
-            partial = []
-            for i, part in enumerate(parts, 1):
-                partial.append(await self._one(part, title, fmt(part[0]["date"]), fmt(part[-1]["date"]), 2500))
+            # части параллельно (vLLM держит до LLM_SEQS запросов сразу), порядок сохраняется
+            sem = asyncio.Semaphore(self.cfg.llm_parallel)
+            done = 0
+
+            async def one(part):
+                nonlocal done
+                async with sem:
+                    text = await self._one(part, title, fmt(part[0]["date"]), fmt(part[-1]["date"]), 2500)
+                done += 1
+                if progress:
+                    await progress(done, len(parts))
+                return text
+
+            partial = await asyncio.gather(*(one(p) for p in parts))
             joined = "\n\n".join(f"### Часть {i}: {fmt(p[0]['date'])}–{fmt(p[-1]['date'])}\n{t}"
-                                 for i, (p, t) in enumerate(zip(parts, partial), 1))
+                                   for i, (p, t) in enumerate(zip(parts, partial), 1))
             prompt = (PROMPT.format(title=title, start=fmt(rows[0]["date"]), end=fmt(now), limit=limit_chars)
                       + "\n\nНиже пересказы последовательных частей переписки — сведи их в один связный пересказ, "
                         "сохрани ссылки на сообщения.\n\n" + joined)
-            out = await self.a.llm.chat([{"role": "user", "content": prompt}], max_tokens=4000)
+            out = await self.a.llm.chat([{"role": "user", "content": prompt}], max_tokens=4000,
+                                        think=self.cfg.retell_think_budget > 0,
+                                        think_budget=self.cfg.retell_think_budget)
             return md_to_tg(out, chat)
 
     async def _one(self, msgs, title, start, end, limit_chars) -> str:
-        budget = self.a.media.budget(self.cfg.step_tokens)
-        content = self.a.interleave([("Переписка:", msgs)], budget)
+        budget = self.a.media.budget(self.cfg.retell_tokens)
+        content = self.a.interleave([("Переписка (#номер ЧЧ:ММ Автор ↩кому ответ: текст):", msgs)], budget, compact=True)
         content.append(L.text(PROMPT.format(title=title, start=start, end=end, limit=limit_chars)))
+        think = dict(think=self.cfg.retell_think_budget > 0, think_budget=self.cfg.retell_think_budget)
         try:
-            return await self.a.llm.chat([{"role": "user", "content": content}], max_tokens=4000,
-                                         think=self.cfg.llm_think, think_budget=self.cfg.llm_think_budget,
-                                         audio_in_video=budget.audio_in_video)
+            return await self.a.llm.chat([{"role": "user", "content": content}], max_tokens=4000, **think)
         except L.LLMError as exc:
             log.warning("пересказ с вложениями не прошёл (%s) — без вложений", exc)
-            text = "\n\n".join(self.a.r.line(m) for m in msgs)
+            text = "\n".join(self.a.r.compact_line(m) for m in msgs)
             return await self.a.llm.chat(
                 [{"role": "user", "content": "Переписка:\n\n" + text + "\n\n" +
-                  PROMPT.format(title=title, start=start, end=end, limit=limit_chars)}], max_tokens=4000)
-
+                  PROMPT.format(title=title, start=start, end=end, limit=limit_chars)}], max_tokens=4000, **think)

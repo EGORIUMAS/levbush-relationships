@@ -92,7 +92,7 @@ class Config:
     llm_autostart: bool = field(default_factory=lambda: env_bool("LLM_AUTOSTART", True))
     llm_model_path: str = field(default_factory=lambda: env(
         "LLM_MODEL_PATH", "/mnt/shared/Models/nemotron3-nano-omni-30b-a3b-nvfp4"))
-    llm_ctx: int = field(default_factory=lambda: env_int("LLM_CTX", 131072))
+    llm_ctx: int = field(default_factory=lambda: env_int("LLM_CTX", 262144))   # предел Nemotron 3 Nano Omni — 256k
     llm_seqs: int = field(default_factory=lambda: env_int("LLM_SEQS", 4))
     llm_parallel: int = field(default_factory=lambda: env_int("LLM_PARALLEL", 4))  # одновременных запросов на медиа
     llm_idle_stop_min: int = field(default_factory=lambda: env_int("LLM_IDLE_STOP_MIN", 15))
@@ -125,6 +125,8 @@ class Config:
 
     daily_at: str = field(default_factory=lambda: env("DAILY_AT", "04:30"))
     stats_interval: int = field(default_factory=lambda: env_int("STATS_INTERVAL", 120))
+    retell_tokens: int = field(default_factory=lambda: env_int("RETELL_TOKENS", 240000))  # один запрос пересказа (ctx 256k)
+    retell_think_budget: int = field(default_factory=lambda: env_int("RETELL_THINK_BUDGET", 1024))  # 0 — без рассуждения
     retell_max_hours: int = field(default_factory=lambda: env_int("RETELL_MAX_HOURS", 48))
 
     @property

@@ -284,20 +284,27 @@ class Analyzer:
         b = datetime.fromtimestamp(w.end, self.cfg.tz)
         return f"{a:%Y-%m-%d %H:%M}–{b:%H:%M}" if a.date() == b.date() else f"{a:%Y-%m-%d %H:%M} – {b:%Y-%m-%d %H:%M}"
 
-    def interleave(self, blocks, budget) -> list:
-        """Окна переписки в запрос: текст сообщений, а вложения — прямо после своего сообщения, как есть."""
-        parts, buf = [], []
+    def interleave(self, blocks, budget, compact: bool = False) -> list:
+        """Окна переписки в запрос: текст сообщений, а вложения — прямо после своего сообщения, как есть.
+        compact — короткие строки (пересказ): дата отдельной строкой при смене дня."""
+        parts, buf, day = [], [], None
+        sep = "\n" if compact else "\n\n"
         for header, msgs in blocks:
             buf.append(header)
             for m in msgs:
-                buf.append(self.r.line(m))
+                if compact:
+                    d = datetime.fromtimestamp(m["date"], self.cfg.tz).strftime("%d.%m.%Y")
+                    if d != day:
+                        buf.append(f"— {d} —")
+                        day = d
+                buf.append(self.r.compact_line(m) if compact else self.r.line(m))
                 media = self.media.parts(m, budget) if m["media"] else []
                 if media:
-                    parts.append(L.text("\n\n".join(buf)))
+                    parts.append(L.text(sep.join(buf)))
                     buf = []
                     parts += media
         if buf:
-            parts.append(L.text("\n\n".join(buf)))
+            parts.append(L.text(sep.join(buf)))
         return parts
 
     def _interactions(self, msgs, people: set) -> set:

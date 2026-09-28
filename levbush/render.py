@@ -137,6 +137,46 @@ class Renderer:
             parts.append("файл слишком большой, не скачан")
         return f"[{label}" + (" — " + "; ".join(parts) if parts else "") + "]"
 
+    def short(self, uid) -> str:
+        return self.name(uid).split(" (@")[0]
+
+    def compact_line(self, m) -> str:
+        """Короткая строка для пересказа: «#id ЧЧ:ММ Имя ↩Кому: текст [вложение] (реакции)» — вдвое короче line()."""
+        t = datetime.fromtimestamp(m["date"], self.cfg.tz)
+        head = f"#{m['id']} {t:%H:%M} {self.short(self.sender(m))}"
+        if m["auto_fwd"]:
+            head += " [пост канала]"
+        if m["reply_to"] and not m["reply_peer"]:
+            target = self.cache.message(m["reply_to"])
+            if target is not None:
+                head += f" ↩{self.short(self.sender(target))}"
+        if m["quote"]:
+            head += f" «{m['quote'][:80]}»"
+        if (m["fwd_from_id"] or m["fwd_from_name"]) and not m["auto_fwd"]:
+            head += " ↪" + (self.short(m["fwd_from_id"]) if m["fwd_from_id"] else m["fwd_from_name"])
+        body = [m["text"]] if m["text"] else []
+        if m["media"]:
+            meta = json.loads(m["media_meta"]) if m["media_meta"] else {}
+            label = MEDIA_RU.get(m["media"], m["media"])
+            if m["media"] == "sticker" and meta.get("emoji"):
+                label += " " + meta["emoji"]
+            if m["media"] == "document" and meta.get("file_name"):
+                label += f" «{meta['file_name']}»"
+            if m["media"] == "poll":
+                label += f": «{meta.get('question')}» — " + " / ".join(meta.get("options") or [])
+            tr = self.cache.transcript(m["id"])
+            if tr:
+                label += f": «{tr}»"
+            if m["media"] == "document":
+                txt = file_text(m["media_path"], meta, 1500) if m["media_state"] == "ok" and m["media_path"] else None
+                if txt:
+                    label += f": {txt}"
+            body.append(f"[{label}]")
+        rows = self.cache.db.execute("select emoji, count(*) from reactions where msg_id = ? group by 1",
+                                     (m["id"],)).fetchall()
+        reacts = " ".join(f"{self.cache.reaction_label(e)}{n}" for e, n in rows)
+        return head + ": " + " ".join(body) + (f" ({reacts})" if reacts else "")
+
     def line(self, m, with_ids: bool = True) -> str:
         dt = datetime.fromtimestamp(m["date"], self.cfg.tz).strftime("%Y-%m-%d %H:%M")
         uid = self.sender(m)
