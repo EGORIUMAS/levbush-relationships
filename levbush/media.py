@@ -20,6 +20,20 @@ from . import llm as L
 from .config import Config
 
 SNDFILE_EXT = {".ogg", ".oga", ".opus", ".wav", ".flac"}   # mp3 vLLM не открывает («File does not exist»)
+AV_KINDS = ("voice", "audio", "video", "video_note", "gif")
+
+
+def is_av(m) -> bool:
+    """Звук или видео: Qwen их не принимает — описывает Nemotron (вместе с расшифровкой Parakeet), Qwen получает
+    описание и кадры. Картинки (фото, PDF, webp-стикеры) Qwen видит сам."""
+    kind = m["media"]
+    meta = json.loads(m["media_meta"]) if m["media_meta"] else {}
+    mime = meta.get("mime") or ""
+    ext = Path(m["media_path"] or "").suffix.lower()
+    return (kind in AV_KINDS or (kind == "sticker" and ext in (".webm", ".mp4"))
+            or (kind == "document" and (mime.startswith("video/") or mime.startswith("audio/"))))
+
+
 LABEL = {"photo": "фото", "video": "видео", "video_note": "кружок", "voice": "голосовое", "audio": "аудио",
          "gif": "GIF", "document": "файл", "sticker": "стикер"}
 
@@ -102,21 +116,22 @@ class Media:
                                 "vp9_metadata=color_space=bt709", str(fixed)], capture_output=True)
             src = str(fixed) if fixed.exists() else src
             dec, ext = ["-c:v", "libvpx-vp9"], "png"        # libvpx сохраняет альфа-канал
-        out = sorted(self.conv.glob(f"{msg_id}-f*.{ext}"))
+        tag = f"{msg_id}-n{n}f"                                # число кадров в имени: Nemotron — 3, Qwen — свои
+        out = sorted(self.conv.glob(f"{tag}*.{ext}"))
         if out:
             return out
         if duration and duration >= 1:
             for i in range(n):
                 at = max(0.0, duration * (i + 0.5) / n)
-                p = self.conv / f"{msg_id}-f{i}.{ext}"
+                p = self.conv / f"{tag}{i}.{ext}"
                 subprocess.run(["ffmpeg", "-v", "error", "-y", *dec, "-ss", f"{at:.2f}", "-i", src, "-frames:v", "1",
                                 str(p)], capture_output=True)
                 if p.exists():
                     out.append(p)
         if not out:                                           # длительность неизвестна — кадр в секунду
             subprocess.run(["ffmpeg", "-v", "error", "-y", *dec, "-i", src, "-vf", "fps=1", "-frames:v", str(n),
-                            str(self.conv / f"{msg_id}-f%d.{ext}")], capture_output=True)
-            out = sorted(self.conv.glob(f"{msg_id}-f*.{ext}"))
+                            str(self.conv / f"{tag}%d.{ext}")], capture_output=True)
+            out = sorted(self.conv.glob(f"{tag}*.{ext}"))
         return out
 
     def _pdf_pages(self, path: str, msg_id: int) -> list[Path]:
@@ -197,6 +212,33 @@ class Media:
             budget.tokens -= cost
             return [L.text(label), L.video(path), L.text(f"Звук из #{m['id']}:"), L.audio(wav)]
         return []
+
+    def qwen_parts(self, m, budget: Budget, desc: str | None) -> list:
+        """Части запроса для Qwen (картинки видит, звук и видео — нет): картинки как есть; у видео, кружков, GIF и
+        видеостикеров — кадры и описание Nemotron; у голосовых — описание (расшифровка и так в строке сообщения)."""
+        if not is_av(m):
+            return self.parts(m, budget)
+        kind, path = m["media"], m["media_path"]
+        label = LABEL.get(kind, kind)
+        out = []
+        visual = kind in ("video", "video_note", "gif", "sticker") or (
+            kind == "document" and (json.loads(m["media_meta"] or "{}").get("mime") or "").startswith("video/"))
+        if (visual and self.cfg.video_frames and m["media_state"] == "ok" and path and Path(path).exists()):
+            dur = float((json.loads(m["media_meta"]) if m["media_meta"] else {}).get("duration") or 0)
+            frames = self._frames(path, m["id"], dur, n=self.cfg.video_frames)[:max(0, budget.image)]
+            cost = sum(self.image_tokens(f) for f in frames)
+            if frames and cost <= budget.tokens:
+                budget.image -= len(frames)
+                budget.tokens -= cost
+                out += [L.text(f"Вложение к сообщению #{m['id']} ({label}), кадры:")] + [L.image(f) for f in frames]
+            elif frames:
+                budget.dropped.append(m["id"])
+        if desc:
+            t = (f"[Описание вложения #{m['id']} ({label}) от Nemotron — он смотрел и слушал его целиком; речь бери "
+                 f"из расшифровки Parakeet, детали Nemotron может выдумать: {desc.strip()}]")
+            budget.tokens -= int(len(t) / 2.8)
+            out.append(L.text(t))
+        return out
 
     def cost(self, m) -> int:
         """Оценка токенов вложения без учёта лимитов запроса (для планирования шагов)."""

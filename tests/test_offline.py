@@ -217,8 +217,9 @@ def test_step(env):
     db = FakeDB()
     an = Analyzer(cfg, cache, db=db, mgr=None)
     fake = FakeLLM()
+    fake.base, fake.model = cfg.llm_url, None
     an._llm = fake
-    an.mgr = type("M", (), {"model": None})()
+    an.mgr = type("M", (), {"model": None, "url": cfg.llm_url, "fixed_model": "", "label": "Nemotron"})()
     an.stat = {"dossiers": 0, "relations": 0}
     an._text_cache, an._tok_cache = {}, {}
     wins = an.windows(an.load_messages())
@@ -478,3 +479,37 @@ def test_invisible_name(tmp_path):
     cache = Cache(tmp_path / "c.db")
     cache.upsert_user({"id": 9, "first_name": "️" * 9, "username": "yMep"})
     assert Renderer(cache, cfg).name(9) == "yMep (@yMep)"
+
+
+def test_qwen_media(env):
+    """Qwen: картинки как есть; видео — кадры + описание Nemotron; голосовое — только описание (текст в строке)."""
+    cfg, cache = env
+    qwen = type("Q", (), {"model": "qwen", "url": cfg.qwen_url, "fixed_model": "qwen", "label": "Qwen"})()
+    an = Analyzer(cfg, cache, db=None, mgr=None, qwen=qwen)
+    msgs = {m["id"]: m for m in an.load_messages()}
+    voice = next(m for m in msgs.values() if m["media"] == "voice")
+    note = next(m for m in msgs.values() if m["media"] == "video_note")
+    cache.set_media_desc(voice["id"], "весёлый тон, смех", "nemotron")
+    cache.set_media_desc(note["id"], "парень машет рукой", "nemotron")
+    b = an.media.budget(10 ** 6)
+    parts = an.media_parts(voice, b)
+    assert [p["type"] for p in parts] == ["text"] and "весёлый тон" in parts[0]["text"]
+    parts = an.media_parts(note, b)
+    kinds = [p["type"] for p in parts]
+    assert kinds.count("image_url") == cfg.video_frames and "audio_url" not in kinds and "video_url" not in kinds
+    assert "парень машет рукой" in parts[-1]["text"] and "Parakeet" in parts[-1]["text"]
+    photo = next(m for m in msgs.values() if m["media"] == "photo")
+    assert [p["type"] for p in an.media_parts(photo, b)] == ["text", "image_url"]
+    # оценка для планирования — без нарезки кадров
+    assert an.media_cost(note) >= cfg.video_frames * 500
+    assert [m["id"] for m in an._undescribed()] and voice["id"] not in [m["id"] for m in an._undescribed()]
+
+
+def test_progress_text_and_eta():
+    from levbush.bot import Levbush
+    assert Analyzer._eta([10, 20], 3) == 45 and Analyzer._eta([], 0) == 0 and Analyzer._eta([], 5) is None
+    st = {"state": "running", "stage": "шаги разбора (Qwen 3.8 27B)", "done": 42, "total": 857, "eta": 7200,
+          "step_date": "2026-05-01", "started": 0}
+    text = Levbush.progress_text(type("B", (), {})(), st)
+    assert "42/857 (4 %)" in text and "переписка за 2026-05-01" in text and "осталось примерно 2 ч" in text
+    assert Levbush.progress_text(None, {"state": "done"}) == ""

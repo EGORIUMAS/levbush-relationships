@@ -20,7 +20,7 @@ from . import stats as S
 from .analyze import Analyzer
 from .cache import Cache
 from .config import Config, cfg
-from .gpu import LLMManager
+from .gpu import LLMManager, served_models
 from .normalize import from_ptb, ptb_chat_row, ptb_user_row, reaction_key
 from .remote import DB
 from .retell import Retell, md_to_tg
@@ -78,7 +78,13 @@ class Levbush:
         self.db = DB(config)
         self.tg = TG(config, self.cache)
         self.tg_ok = False
-        self.mgr = LLMManager(config, notify=self.notify_admin)
+        self.mgr = LLMManager(config, notify=self.notify_admin)                    # Nemotron: звук и видео
+        self.qwen = (LLMManager(config, notify=self.notify_admin, kind="qwen")      # Qwen: досье, связи, пересказ
+                     if config.qwen_model_path else None)
+        if self.qwen:
+            self.mgr.peers, self.qwen.peers = [self.qwen], [self.mgr]
+        self.progress_msg = None                  # сообщение админу с прогрессом разбора
+        self.progress_edit = 0.0
         self.analyzer: Analyzer | None = None
         self.retell: Retell | None = None
         self.app: Application | None = None
@@ -123,6 +129,50 @@ class Levbush:
 
         task.add_done_callback(done)
         return task
+
+    @property
+    def servers(self) -> list[LLMManager]:
+        return [m for m in (self.mgr, self.qwen) if m]
+
+    def progress_text(self, st: dict) -> str:
+        """Этап разбора, сколько сделано и сколько примерно осталось."""
+        if not st or st.get("state") != "running":
+            return ""
+        out = f"🧠 {esc(st.get('stage') or 'разбор')}"
+        if st.get("total"):
+            done, total = st.get("done") or 0, st["total"]
+            out += f": {done}/{total} ({100 * done // max(1, total)} %)"
+        if st.get("step_date"):
+            out += f", переписка за {st['step_date']}"
+        if st.get("eta") is not None:
+            out += f"\n⏱ осталось примерно {S.fmt_duration(st['eta']) if st['eta'] else 'меньше минуты'}"
+        if st.get("started"):
+            out += f" (идёт {S.fmt_duration(time.time() - st['started'])})"
+        return out
+
+    async def show_progress(self, st: dict):
+        """Сообщение админу с прогрессом разбора — правится не чаще раза в 30 с."""
+        if not self.app or not self.cfg.admin_id:
+            return
+        text = self.progress_text(st)
+        if not text:
+            self.progress_msg = None
+            return
+        now = time.monotonic()
+        stage_changed = self.progress_msg is not None and getattr(self, "_progress_stage", None) != st.get("stage")
+        if self.progress_msg is not None and not stage_changed and now - self.progress_edit < 30:
+            return
+        self.progress_edit, self._progress_stage = now, st.get("stage")
+        try:
+            if self.progress_msg is None:
+                self.progress_msg = await self.app.bot.send_message(self.cfg.admin_id, text, parse_mode=ParseMode.HTML)
+            else:
+                await self.progress_msg.edit_text(text, parse_mode=ParseMode.HTML)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                log.warning("прогресс: %s", exc)
+        except TelegramError as exc:
+            log.warning("прогресс: %s", exc)
 
     def busy(self, name: str) -> bool:
         return any(t.get_name() == name for t in self.bg)
@@ -173,7 +223,8 @@ class Levbush:
         skipped, removed = self.cache.skip_unwanted_media()
         if skipped:
             log.info("вложения, которые нейросеть не примет: сняты с очереди %d, удалено файлов %d", skipped, removed)
-        self.analyzer = Analyzer(self.cfg, self.cache, self.db, self.mgr, notify=self.notify_admin)
+        self.analyzer = Analyzer(self.cfg, self.cache, self.db, self.mgr, notify=self.notify_admin, qwen=self.qwen)
+        self.analyzer.on_progress = self.show_progress
         self.retell = Retell(self.analyzer)
         await app.bot.set_my_commands([
             BotCommand("stats", "статистика: /stats [@ник] или ответом"),
@@ -183,11 +234,13 @@ class Levbush:
             BotCommand("dossier", "досье: /dossier [@ник] или ответом"),
             BotCommand("links", "связи человека"),
             BotCommand("retell", "пересказ: /retell 2ч | 14:30 | вчера 20:00 или ответом"),
+            BotCommand("text", "расшифровка голосового или кружка (ответом; в личке — просто пришли)"),
             BotCommand("map", "карта связей"),
             BotCommand("help", "справка"),
         ], scope=BotCommandScopeAllPrivateChats())
         await app.bot.set_my_commands([
             BotCommand("retell", "пересказ: /retell 2ч или ответом на сообщение"),
+            BotCommand("text", "расшифровать голосовое или кружок (ответом)"),
             BotCommand("stats", "статистика"), BotCommand("top", "топ участников"),
             BotCommand("pair", "пара"), BotCommand("dossier", "досье"), BotCommand("map", "карта связей"),
         ], scope=BotCommandScopeAllGroupChats())
@@ -217,10 +270,11 @@ class Levbush:
     async def post_shutdown(self, app: Application):
         for t in list(self.bg):
             t.cancel()
-        if self.mgr._idle_task and not self.mgr._idle_task.done():
-            self.mgr._idle_task.cancel()
-        if self.mgr.started_by_us:
-            await self.mgr.stop()
+        for mgr in self.servers:
+            if mgr._idle_task and not mgr._idle_task.done():
+                mgr._idle_task.cancel()
+            if mgr.started_by_us:
+                await mgr.stop()
         await self.tg.close()
         await self.db.close()
 
@@ -474,9 +528,11 @@ class Levbush:
             "/pair @a [@b] — кто кого: ответы, цитаты, упоминания, реакции\n"
             "/dossier [@ник] — досье, /links [@ник] — связи\n"
             f"/retell 2ч | 30м | 14:30 | вчера 20:00 — пересказ (не дальше {self.cfg.retell_max_hours} ч), "
-            "или ответом на сообщение — с него\n/map — карта связей")
+            "или ответом на сообщение — с него\n/text — расшифровка голосового или кружка (ответом на него; в личке "
+            "бота можно просто прислать голосовое)\n/map — карта связей")
         if self.is_admin(update):
-            text += ("\n\nАдмин: /initiate (запуск сбора), /status, /analyze, /sync, "
+            text += ("\n\nАдмин: /initiate (запуск сбора), /status, /analyze, /describe (описать новые видео и "
+                     "голосовые Nemotron'ом сейчас), /sync, "
                      "/maintenance on [причина] | off — техобслуживание")
         btn = self.map_button(update)
         await self.reply(update, text, InlineKeyboardMarkup([[btn]]) if btn else None)
@@ -759,8 +815,8 @@ class Levbush:
                 if self.tg_ok:
                     # новые сообщения и так приходят вживую; медиа отрезка — сразу, мимо очереди начального сбора
                     await self.tg.download_since(since_ts)
-                if not await self.mgr.is_up():
-                    await status.edit_text("⏳ Поднимаю Nemotron (~2 мин), потом перескажу…")
+                if self.qwen and not await self.qwen.is_up() and not await served_models(self.cfg.fallback_llm_url):
+                    await status.edit_text(f"⏳ Поднимаю {self.qwen.label} (~1–2 мин), потом перескажу…")
                 last = 0.0
 
                 async def progress(done, total):
@@ -789,6 +845,76 @@ class Levbush:
             for chunk in chunks[1:]:
                 await status.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
+    # ------------------------------------------------------------ расшифровка голосовых и кружков
+
+    @staticmethod
+    def speech_of(m):
+        """Голосовое, кружок, аудио или видео сообщения — (объект файла, подпись) или None."""
+        for attr, label in (("voice", "голосовое"), ("video_note", "кружок"), ("audio", "аудио"), ("video", "видео")):
+            obj = getattr(m, attr, None)
+            if obj:
+                return obj, label
+        return None
+
+    async def cmd_text(self, update: Update, ctx):
+        """/text ответом на голосовое или кружок — расшифровка Parakeet (для всех участников группы)."""
+        if not await self.allowed(update):
+            return
+        m = update.effective_message
+        target = m.reply_to_message if m.reply_to_message and self.speech_of(m.reply_to_message) else m
+        if not self.speech_of(target):
+            await self.reply(update, "Ответь командой /text на голосовое или кружок — пришлю расшифровку. "
+                                     "В личке можно просто прислать или переслать мне голосовое.")
+            return
+        await self.transcribe_reply(target, m)
+
+    async def on_private_speech(self, update: Update, ctx):
+        """Голосовое или кружок в личке — сразу расшифровка (только участникам группы)."""
+        m = update.effective_message
+        if m is None or update.effective_chat.type != ChatType.PRIVATE or not self.speech_of(m):
+            return
+        if not await self.allowed(update) or (self.maintenance and not self.is_admin(update)):
+            return
+        await self.transcribe_reply(m, m)
+
+    async def transcribe_reply(self, target, answer_to):
+        obj, label = self.speech_of(target)
+        dur = getattr(obj, "duration", None) or 0
+        in_group = target.chat_id == self.chat_id
+        text = self.cache.transcript(target.message_id) if in_group else None
+        if not text:
+            if (obj.file_size or 0) > 20 * 1024 * 1024:
+                await answer_to.reply_text("Файл больше 20 МБ — бот не может его скачать.")
+                return
+            status = await answer_to.reply_text(f"🗣 Расшифровываю {label}…")
+            tmp = self.cfg.data_dir / "tmp"
+            tmp.mkdir(exist_ok=True)
+            path = tmp / f"speech-{target.chat_id}-{target.message_id}"
+            try:
+                f = await obj.get_file()
+                await f.download_to_drive(path)
+                text, seconds = await self.analyzer.transcribe_file(str(path))
+                dur = dur or seconds
+            except Exception as exc:  # noqa: BLE001
+                log.exception("расшифровка")
+                await status.edit_text(f"❌ Не получилось: {esc(exc)}", parse_mode=ParseMode.HTML)
+                return
+            finally:
+                path.unlink(missing_ok=True)
+            if in_group and text:
+                self.cache.set_transcript(target.message_id, text, dur, "parakeet-tdt-0.6b-v3")
+        else:
+            status = None
+        head = f"🗣 <b>Расшифровка</b> ({label}{', ' + S.fmt_duration(dur) if dur else ''}):\n"
+        body = esc(text) if text else "<i>речи не слышно</i>"
+        chunks = split_html(head + body)
+        if status is not None:
+            await status.edit_text(chunks[0], parse_mode=ParseMode.HTML)
+        else:
+            await answer_to.reply_text(chunks[0], parse_mode=ParseMode.HTML)
+        for chunk in chunks[1:]:
+            await answer_to.reply_text(chunk, parse_mode=ParseMode.HTML)
+
     # ------------------------------------------------------------ админ
 
     async def cmd_status(self, update: Update, ctx):
@@ -809,9 +935,9 @@ class Levbush:
             f"Разобрано окон: {done}",
             f"Статистика выгружена: {datetime.fromtimestamp(self.last_stats, self.cfg.tz):%H:%M:%S}"
             if self.last_stats else "Статистика ещё не выгружалась",
-            f"Nemotron: {'работает' if await self.mgr.is_up() else 'не запущен'}",
-            f"Разбор: {esc(st.get('state', '—'))} {esc(st.get('stage', ''))} "
-            + (f"{st.get('done')}/{st.get('total')}" if st.get("total") else ""),
+            *[f"{m.label}: {'работает' if await m.is_up() else 'не запущен'}" for m in self.servers],
+            f"Описаний медиа: {c.execute('select count(*) from media_desc where text <> \'\'').fetchone()[0]}",
+            (self.progress_text(st) or f"Разбор: {esc(st.get('state', '—'))} {esc(st.get('stage', ''))}"),
             f"Сбор: {'запущен' if self.initiated else 'не запускался (/initiate)'}; очередь реакций "
             f"{c.execute('select count(*) from reaction_todo').fetchone()[0]}; темп ×{self.tg.slow:g}, "
             f"FloodWait: {self.tg.floods}",
@@ -828,6 +954,27 @@ class Levbush:
         self.cache.set("analysis_started", int(time.time()))
         self.spawn(self.analyzer.run("вручную"), "разбор")
         await self.reply(update, "🧠 Запустил разбор. Прогресс — /status и на карте.")
+
+    async def cmd_describe(self, update: Update, ctx):
+        """Nemotron описывает новые голосовые, кружки, видео и GIF сейчас, не дожидаясь ежедневного разбора."""
+        if not self.is_admin(update):
+            return
+        if self.busy("описание медиа") or self.analyzer.running:
+            await self.reply(update, "Уже идёт — /status.")
+            return
+        n = len(self.analyzer._undescribed())
+        if not n:
+            await self.reply(update, "Новых голосовых, кружков и видео без описания нет.")
+            return
+
+        async def run():
+            done = await self.analyzer.describe_pending()
+            self.analyzer.state = {"state": "idle"}
+            await self.notify_admin(f"✅ Описано вложений: {done}")
+
+        self.analyzer.state = {"state": "running", "started": int(time.time())}
+        self.spawn(run(), "описание медиа")
+        await self.reply(update, f"🎞 Nemotron описывает {n} вложений. Прогресс — /status.")
 
     # ------------------------------------------------------------ техобслуживание
 
@@ -872,8 +1019,9 @@ class Levbush:
             stopped = [t.get_name() for t in list(self.bg)]
             for t in list(self.bg):
                 t.cancel()
-            if self.mgr.started_by_us:
-                await self.mgr.stop()
+            for mgr in self.servers:
+                if mgr.started_by_us:
+                    await mgr.stop()
             await self.announce("🔧 Бот уходит на техобслуживание" + (f": {reason}" if reason else "") +
                                 ". Команды временно не работают, сообщения группы по-прежнему учитываются.")
             await self.reply(update, "🔧 Техобслуживание включено." +
@@ -982,12 +1130,14 @@ def build(config: Config = cfg) -> Application:
     cmds = {"help": lb.cmd_help, "start": lb.cmd_help, "stats": lb.cmd_stats, "me": lb.cmd_me, "top": lb.cmd_top,
             "pair": lb.cmd_pair, "dossier": lb.cmd_dossier, "links": lb.cmd_links, "map": lb.cmd_map,
             "retell": lb.cmd_retell, "status": lb.cmd_status, "analyze": lb.cmd_analyze, "sync": lb.cmd_sync,
-            "initiate": lb.cmd_initiate}
+            "initiate": lb.cmd_initiate, "text": lb.cmd_text, "describe": lb.cmd_describe}
     cmds["maintenance"] = lb.cmd_maintenance
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, lb.guard(fn)), group=1)
     # сбор — отдельной группой обработчиков, чтобы команды в группе тоже попадали в кэш
     app.add_handler(MessageHandler(filters.ALL, lb.on_message), group=0)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO),
+                                   lb.on_private_speech), group=2)
     app.add_handler(MessageReactionHandler(lb.on_reaction, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED), group=0)
     app.add_handler(MessageReactionHandler(lb.on_reaction_count, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_COUNT_UPDATED), group=0)
     app.add_handler(ChatMemberHandler(lb.on_member, ChatMemberHandler.CHAT_MEMBER), group=0)

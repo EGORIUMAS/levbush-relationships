@@ -100,6 +100,14 @@ create table if not exists transcripts (
     created integer
 );
 
+-- описания звука и видео от Nemotron (для моделей, которые их не принимают): голосовые, кружки, видео, GIF
+create table if not exists media_desc (
+    msg_id  integer primary key,
+    text    text not null,          -- '' — описать не удалось
+    model   text,
+    created integer
+);
+
 create table if not exists analyzed (
     episode_id integer primary key,
     last_id    integer not null,
@@ -313,3 +321,13 @@ class Cache:
     def set_transcript(self, msg_id: int, text: str, seconds: float | None, model: str):
         self.db.execute("insert or replace into transcripts(msg_id, text, seconds, model, created) values (?, ?, ?, ?, ?)",
                         (msg_id, text, seconds, model, int(time.time())))
+
+    # ------------------------------------------------------------ описания медиа
+
+    def media_desc(self, msg_id: int):
+        row = self.db.execute("select text from media_desc where msg_id = ?", (msg_id,)).fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_media_desc(self, msg_id: int, text: str, model: str):
+        self.db.execute("insert or replace into media_desc(msg_id, text, model, created) values (?, ?, ?, ?)",
+                        (msg_id, text, model, int(time.time())))

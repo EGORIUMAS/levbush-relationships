@@ -99,8 +99,19 @@ class Config:
     llm_need_gib: float = field(default_factory=lambda: env_float("LLM_NEED_GIB", 28.0))
     llm_think: bool = field(default_factory=lambda: env_bool("LLM_THINK", True))             # рассуждение Nemotron
     llm_think_budget: int = field(default_factory=lambda: env_int("LLM_THINK_BUDGET", 8192))  # токенов на рассуждение
+    # общий сервер пользователя (run-qwen.sh: прокси автовыгрузки :8080 → vllm :18081) — пересказ сначала идёт туда
     fallback_llm_url: str = field(default_factory=lambda: env("FALLBACK_LLM_URL", "http://127.0.0.1:8080").rstrip("/"))
-    qwen_port: int = field(default_factory=lambda: env_int("QWEN_PORT", 18081))
+    qwen_port: int = field(default_factory=lambda: env_int("QWEN_PORT", 18081))    # его vllm — усыпить ради VRAM
+    # Qwen для разбора и пересказа (свой юнит levbush-qwen): Nemotron слабее в досье, он описывает звук и видео
+    qwen_url: str = field(default_factory=lambda: env("QWEN_URL", "http://127.0.0.1:18091").rstrip("/"))
+    qwen_model_path: str = field(default_factory=lambda: env("QWEN_MODEL_PATH", "/mnt/shared/Models/qwen38-27b-nvfp4"))
+    qwen_name: str = field(default_factory=lambda: env("QWEN_NAME", "qwen3.8-27b"))
+    qwen_ctx: int = field(default_factory=lambda: env_int("QWEN_CTX", 131072))
+    qwen_util: float = field(default_factory=lambda: env_float("QWEN_UTIL", 0.92))
+    qwen_seqs: int = field(default_factory=lambda: env_int("QWEN_SEQS", 2))       # 2 — пересказ во время разбора
+    qwen_mtp: int = field(default_factory=lambda: env_int("QWEN_MTP", 3))          # 0 — без MTP; с MTP только fp8 KV
+    qwen_need_gib: float = field(default_factory=lambda: env_float("QWEN_NEED_GIB", 29.0))   # 0,92 × 31,4
+    video_frames: int = field(default_factory=lambda: env_int("VIDEO_FRAMES", 4))  # кадров видео/GIF для Qwen
     # шаг разбора: несколько последовательных окон + контекст + текущие досье и связи
     step_tokens: int = field(default_factory=lambda: env_int("STEP_TOKENS", 60000))   # новые окна: текст + медиа
     step_context_chars: int = field(default_factory=lambda: env_int("STEP_CONTEXT_CHARS", 30000))  # уже разобранные

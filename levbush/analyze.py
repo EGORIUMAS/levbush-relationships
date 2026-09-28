@@ -24,7 +24,7 @@ from .dossier import (REL_NOTES, SECTIONS, apply_person, apply_relation, empty_d
                       prompt_person, prompt_relation, render_person, render_relation)
 from .episodes import Episode, is_closed, segment
 from .gpu import LLMManager
-from .media import Media
+from .media import Media, is_av
 from .remote import DB, ts
 from .render import Renderer
 
@@ -92,7 +92,23 @@ person, a, b — id людей; msgs — номера сообщений (#25356
 кто с кем шутит, спорит, флиртует, кто кого поддерживает. Все тексты в JSON — ТОЛЬКО на русском языке."""
 
 
+SERVED_NEMOTRON = "nemotron3-nano-omni"
+DESCRIBE = """Это вложение из группового Telegram-чата. Сообщение с ним (если во вложении есть речь, её расшифровка
+Parakeet — в квадратных скобках после «расшифровка:»; Parakeet понимает русский, опирайся на неё):
+{line}
+
+Тип вложения: {kind}.
+Опиши вложение для человека, который его не видит, — по-русски, 1–4 предложения, только то, что действительно есть:
+что изображено или происходит (для видео и GIF); весь различимый текст на картинке или в кадре — дословно в кавычках;
+кто в кадре (внешность, эмоции, жесты — только если есть изображение); если это мем или стикер — что он выражает.
+Для голосовых, кружков и видео со звуком: тон и эмоции голоса (пол говорящего не угадывай), смех, музыка, фон, к кому
+обращаются; содержание речи уже есть в расшифровке — не пересказывай её, но можешь пояснить, к чему она относится."""
+DESCRIBE_KIND = {"voice": "голосовое — ТОЛЬКО ЗВУК, изображения нет, ничего не пиши про кадр и внешность",
+                 "audio": "аудиофайл — только звук", "video_note": "кружок (видео со звуком, фронтальная камера)",
+                 "video": "видео", "gif": "GIF — анимация без звука", "document": "файл (видео или звук)"}
+
 CHARS_PER_TOKEN = 2.8     # грубая оценка для русского текста
+TOK_FRAME = 700           # кадр видео у Qwen (max_pixels 1 Мпикс): кружок ~300, 720p ~1300
 
 
 def _dt(ts_: int, cfg: Config) -> str:
@@ -100,8 +116,10 @@ def _dt(ts_: int, cfg: Config) -> str:
 
 
 class Analyzer:
-    def __init__(self, cfg: Config, cache: Cache, db: DB, mgr: LLMManager, notify=None):
+    def __init__(self, cfg: Config, cache: Cache, db: DB, mgr: LLMManager, notify=None, qwen: LLMManager | None = None):
+        """mgr — Nemotron (описывает звук и видео); qwen — модель разбора. Без qwen разбирает сам Nemotron."""
         self.cfg, self.cache, self.db, self.mgr = cfg, cache, db, mgr
+        self.qwen = qwen
         self.notify = notify
         self.r = Renderer(cache, cfg)
         self.chat = cache.get("chat", {}) or {}
@@ -114,6 +132,8 @@ class Analyzer:
         self._tok_cache: dict = {}
         self._names: dict[int, list[str]] | None = None     # uid → как называют (досье + имя профиля)
         self.stat: dict = {}
+        self.on_progress = None       # async def (state) — бот показывает прогресс админу
+        self.asr_lock = asyncio.Lock()  # Parakeet — один процесс за раз (~1,2 ГиБ VRAM)
 
     async def _progress(self, **kw):
         self.state.update(kw, updated=int(time.time()))
@@ -121,6 +141,19 @@ class Analyzer:
             await self.db.set_pass(self.state)
         except Exception:  # noqa: BLE001 — прогресс не критичен
             log.exception("set_pass")
+        if self.on_progress:
+            try:
+                await self.on_progress(dict(self.state))
+            except Exception:  # noqa: BLE001
+                log.exception("on_progress")
+
+    @staticmethod
+    def _eta(durations: list[float], remaining: int) -> int | None:
+        """Сколько ещё: среднее по последним 20 единицам × оставшиеся."""
+        if not durations or remaining <= 0:
+            return 0 if remaining <= 0 else None
+        last = durations[-20:]
+        return int(sum(last) / len(last) * remaining)
 
     async def _say(self, text):
         log.info(text)
@@ -132,9 +165,33 @@ class Analyzer:
 
     @property
     def llm(self) -> L.LLM:
-        if self._llm is None or self._llm.model != self.mgr.model:
-            self._llm = L.LLM(self.cfg.llm_url, self.mgr.model or "nemotron3-nano-omni")
+        t = self.thinker
+        if self._llm is None or self._llm.model != t.model or self._llm.base != t.url:
+            self._llm = L.LLM(t.url, t.model or t.fixed_model or "nemotron3-nano-omni")
         return self._llm
+
+    @property
+    def thinker(self) -> LLMManager:
+        """Кто пишет досье и связи."""
+        return self.qwen or self.mgr
+
+    @property
+    def ctx(self) -> int:
+        return self.cfg.qwen_ctx if self.qwen else self.cfg.llm_ctx
+
+    def media_parts(self, m, budget) -> list:
+        """Вложение для модели разбора: Nemotron получает файл как есть, Qwen — картинки, кадры и описания."""
+        if self.qwen:
+            return self.media.qwen_parts(m, budget, self.cache.media_desc(m["id"]))
+        return self.media.parts(m, budget)
+
+    def media_cost(self, m) -> int:
+        """Оценка токенов вложения для планирования шагов — без нарезки кадров (иначе ffmpeg по всей истории)."""
+        if not self.qwen or not is_av(m):
+            return self.media.cost(m)
+        desc = self.cache.media_desc(m["id"]) or ""
+        visual = m["media"] in ("video", "video_note", "gif", "sticker") or "video/" in (m["media_meta"] or "")
+        return (self.cfg.video_frames * TOK_FRAME if visual else 0) + int(len(desc) / CHARS_PER_TOKEN) + 60
 
     def _is_person(self, uid) -> bool:
         if uid is None or uid in self.hidden:
@@ -164,30 +221,100 @@ class Analyzer:
             jobs.append({"id": r["id"], "path": r["media_path"]})
         if not jobs:
             return 0
-        if report:
-            await self._progress(stage="расшифровка речи", done=0, total=len(jobs))
+        async with self.asr_lock:
+            return await self._transcribe_jobs(jobs, report)
+
+    async def transcribe_file(self, path: str) -> tuple[str, float]:
+        """Расшифровка одного файла (команда /text): (текст, секунд)."""
+        out = {}
+        async with self.asr_lock:
+            async for r in self._asr([{"id": 0, "path": path}]):
+                out = r
+        if "error" in out or "text" not in out:
+            raise RuntimeError(out.get("error") or "Parakeet ничего не вернул")
+        return out["text"], out.get("seconds") or 0
+
+    async def _asr(self, jobs):
         proc = await asyncio.create_subprocess_exec(
             self.cfg.asr_python, str(ROOT / "levbush" / "asr_worker.py"),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, limit=1 << 24)
         proc.stdin.write("".join(json.dumps(j) + "\n" for j in jobs).encode())
         await proc.stdin.drain()
         proc.stdin.close()
-        done = 0
         async for line in proc.stdout:
             out = json.loads(line)
-            if out.get("ready"):
-                continue
+            if not out.get("ready"):
+                yield out
+        await proc.wait()
+
+    async def _transcribe_jobs(self, jobs, report) -> int:
+        if report:
+            await self._progress(stage="расшифровка речи (Parakeet)", done=0, total=len(jobs), eta=None)
+        t0 = time.time()
+        done = 0
+        async for out in self._asr(jobs):
             if "error" in out:
                 self.cache.set_transcript(out["id"], "", None, "error")
             else:
                 self.cache.set_transcript(out["id"], out["text"], out.get("seconds"), "parakeet-tdt-0.6b-v3")
             done += 1
             if report and done % 20 == 0:
-                await self._progress(done=done)
-        await proc.wait()
+                await self._progress(done=done, eta=int((time.time() - t0) / done * (len(jobs) - done)))
         return done
 
-    # ================================================================ медиа
+    # ================================================================ медиа: описания Nemotron для Qwen
+
+    def _undescribed(self, ids: list[int] | None = None) -> list:
+        rows = self.cache.db.execute(
+            """select m.* from messages m left join media_desc d on d.msg_id = m.id
+               where d.msg_id is null and m.media is not null and m.media_state = 'ok' and not m.deleted
+               order by m.id""").fetchall()
+        if ids is not None:
+            wanted = set(ids)
+            rows = [r for r in rows if r["id"] in wanted]
+        return [r for r in rows if is_av(r)]
+
+    async def describe_pending(self, ids: list[int] | None = None, report: bool = True) -> int:
+        """Nemotron описывает звук и видео (голосовые, кружки, видео, GIF, видеостикеры) — вместе с расшифровкой
+        Parakeet. Qwen потом получает эти описания текстом."""
+        rows = self._undescribed(ids)
+        if not rows:
+            return 0
+        await self.transcribe_pending([r["id"] for r in rows], report=False)
+        rows = self._undescribed([r["id"] for r in rows])      # с расшифровками
+        done, durations, t0 = 0, [], time.time()
+        if report:
+            await self._progress(stage="описание звука и видео (Nemotron)", done=0, total=len(rows), eta=None)
+        async with self.mgr.use():
+            llm = L.LLM(self.mgr.url, self.mgr.model or SERVED_NEMOTRON)
+            sem = asyncio.Semaphore(self.cfg.llm_parallel)
+            last_report = 0.0
+
+            async def one(m):
+                nonlocal done, last_report
+                parts = self.media.parts(m, self.media.budget(10 ** 6))
+                if not parts:
+                    self.cache.set_media_desc(m["id"], "", "skip")
+                    return
+                kind = DESCRIBE_KIND.get(m["media"], "анимированный стикер без звука")
+                content = [L.text(DESCRIBE.format(line=self.r.line(m), kind=kind))] + parts
+                async with sem:
+                    t = time.time()
+                    try:
+                        text = await llm.chat([{"role": "user", "content": content}], None, max_tokens=400,
+                                              temperature=0.2, think=False, retries=1)
+                        self.cache.set_media_desc(m["id"], text, "nemotron")
+                    except L.LLMError as exc:        # повторится в следующий раз
+                        log.warning("описание #%s: %s", m["id"], exc)
+                    durations.append((time.time() - t) / self.cfg.llm_parallel)
+                done += 1
+                if report and time.monotonic() - last_report > 20:
+                    last_report = time.monotonic()
+                    await self._progress(done=done, eta=self._eta(durations, len(rows) - done))
+
+            await asyncio.gather(*(one(m) for m in rows))
+        log.info("описано вложений: %d за %.0f с", done, time.time() - t0)
+        return done
 
     # ================================================================ окна и шаги
 
@@ -210,7 +337,7 @@ class Analyzer:
         return self._text_cache[key]
 
     def _msg_tokens(self, m) -> int:
-        return int(len(self.r.line(m)) / CHARS_PER_TOKEN) + (self.media.cost(m) if m["media"] else 0)
+        return int(len(self.r.line(m)) / CHARS_PER_TOKEN) + (self.media_cost(m) if m["media"] else 0)
 
     def _tokens(self, e: Episode) -> int:
         """Оценка токенов окна: текст + медиа как есть."""
@@ -298,7 +425,7 @@ class Analyzer:
                         buf.append(f"— {d} —")
                         day = d
                 buf.append(self.r.compact_line(m) if compact else self.r.line(m))
-                media = self.media.parts(m, budget) if m["media"] else []
+                media = self.media_parts(m, budget) if m["media"] else []
                 if media:
                     parts.append(L.text(sep.join(buf)))
                     buf = []
@@ -550,7 +677,7 @@ class Analyzer:
         chars = sum(len(p["text"]) for p in content if p["type"] == "text")
         media_tokens = self.cfg.step_tokens - budget.tokens
         est = int(chars / CHARS_PER_TOKEN) + media_tokens
-        room = self.cfg.llm_ctx - est - 1000 - (self.cfg.llm_think_budget if self.cfg.llm_think else 0)
+        room = self.ctx - est - 1000 - (self.cfg.llm_think_budget if self.cfg.llm_think else 0)
         if room < 6000 and last - first > 1:
             raise _TooBig()
         max_tokens = max(4000, min(12000, room))      # правки — не романы; зацикливание обрывается раньше
@@ -672,13 +799,15 @@ class Analyzer:
             raise RuntimeError("разбор уже идёт")
         self.running = True
         started = time.time()
-        self.stat = {"transcribed": 0, "windows": 0, "steps": 0, "dossiers": 0, "relations": 0}
+        self.stat = {"transcribed": 0, "described": 0, "windows": 0, "steps": 0, "dossiers": 0, "relations": 0}
         self._text_cache, self._tok_cache = {}, {}
         self._names = None                       # указатель имён перечитывается из досье в начале прогона
         try:
             self.state = {"state": "running", "reason": reason, "started": int(started)}
             await self._progress(stage="подготовка")
             self.stat["transcribed"] = await self.transcribe_pending()
+            if self.qwen:                               # Qwen не слышит и не видит видео — сначала описания
+                self.stat["described"] = await self.describe_pending()
             now = int(time.time())
             msgs = self.load_messages()
             wins = self.windows(msgs)
@@ -686,12 +815,17 @@ class Analyzer:
             if not steps:
                 await self._progress(state="done", stage="нечего разбирать")
                 return self.stat
-            await self._say(f"🧠 Разбор ({reason}): окон {sum(b - a for a, b in steps)}, шагов {len(steps)}")
-            async with self.mgr.use():
+            await self._say(f"🧠 Разбор ({reason}): окон {sum(b - a for a, b in steps)}, шагов {len(steps)}, "
+                            f"модель {self.thinker.label}")
+            durations = []
+            await self._progress(stage=f"шаги разбора ({self.thinker.label})", done=0, total=len(steps), eta=None,
+                                 step_date=None)
+            async with self.thinker.use():
                 for i, (a, b) in enumerate(steps, 1):
                     when = datetime.fromtimestamp(wins[a].start, self.cfg.tz)
-                    await self._progress(stage=f"шаг {i}/{len(steps)}: переписка за {when:%Y-%m-%d}",
-                                         done=i - 1, total=len(steps))
+                    await self._progress(done=i - 1, step_date=f"{when:%Y-%m-%d}",
+                                         eta=self._eta(durations, len(steps) - i + 1))
+                    t = time.time()
                     try:
                         await self._run_step(wins, a, b, now)
                         self.stat["windows"] += b - a
@@ -699,13 +833,14 @@ class Analyzer:
                         log.exception("шаг %d", i)
                         for w in wins[a:b]:
                             self._mark(w, "error", str(exc)[:300])
+                    durations.append(time.time() - t)
                     self.stat["steps"] += 1
             self.state = {"state": "done", "finished": int(time.time()), "reason": reason, **self.stat}
             await self.db.set_pass(self.state, map_updated=True)
             errors = self.cache.db.execute("select count(*) from analyzed where status = 'error'").fetchone()[0]
             await self._say(f"✅ Разбор готов за {(time.time() - started) / 60:.0f} мин: окон {self.stat['windows']}, "
                             f"шагов {self.stat['steps']}, расшифровок "
-                            f"{self.stat['transcribed']}, правок досье {self.stat['dossiers']}, связей "
+                            f"{self.stat['transcribed']}, описаний медиа {self.stat['described']}, правок досье {self.stat['dossiers']}, связей "
                             f"{self.stat['relations']}" + (f". Окон с ошибкой: {errors} — повторю в следующий раз"
                                                           if errors else ""))
             self.cache.db.execute("delete from analyzed where status = 'error'")

@@ -96,11 +96,15 @@ async def _analyze(reason: str):
         print(text, flush=True)
 
     mgr = LLMManager(cfg, notify=say)
+    qwen = LLMManager(cfg, notify=say, kind="qwen") if cfg.qwen_model_path else None
+    if qwen:
+        mgr.peers, qwen.peers = [qwen], [mgr]
     try:
-        print(await Analyzer(cfg, Cache(cfg.cache_db), db, mgr, notify=say).run(reason))
+        print(await Analyzer(cfg, Cache(cfg.cache_db), db, mgr, notify=say, qwen=qwen).run(reason))
     finally:
-        if mgr.started_by_us:
-            await mgr.stop()
+        for m in (mgr, qwen):
+            if m and m.started_by_us:
+                await m.stop()
         await db.close()
 
 

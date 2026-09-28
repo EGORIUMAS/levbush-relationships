@@ -71,7 +71,8 @@ class LLM:
         if think and think_budget:
             # мягко — подсказкой в шаблоне модели, жёстко — ограничением vLLM (потом рассуждение закрывается)
             body["chat_template_kwargs"]["reasoning_budget"] = think_budget
-            body["thinking_token_budget"] = think_budget
+            body["thinking_token_budget"] = think_budget       # vLLM
+            body["thinking_budget_tokens"] = think_budget      # llama.cpp (llama-server)
         if audio_in_video:
             body["mm_processor_kwargs"] = {"use_audio_in_video": True}
         if schema is not None and self._schema_ok:
