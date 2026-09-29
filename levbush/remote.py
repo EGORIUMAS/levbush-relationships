@@ -23,7 +23,8 @@ def ts(value):
 
 
 def strength(quant: float, llm: float | None) -> float:
-    return quant if llm is None else round(0.4 * quant + 0.6 * llm, 4)
+    """Сила связи; нет оценки нейросети — она считается за 0."""
+    return round(0.4 * quant + 0.6 * (llm or 0.0), 4)
 
 
 def _h(obj) -> str:
@@ -137,10 +138,9 @@ class DB:
                         [(k[0], k[1], c) for k, c in pairs])
                 if rels:
                     await conn.executemany(
-                        """insert into relations(a, b, quant, co_episodes, strength) values ($1, $2, $3, $4, $3)
+                        """insert into relations(a, b, quant, co_episodes, strength) values ($1, $2, $3, $4, 0.4 * $3)
                            on conflict(a, b) do update set quant=excluded.quant, co_episodes=excluded.co_episodes,
-                               strength = case when relations.llm_score is null then excluded.quant
-                                               else 0.4 * excluded.quant + 0.6 * relations.llm_score end""",
+                               strength = 0.4 * excluded.quant + 0.6 * coalesce(relations.llm_score, 0)""",
                         [(k[0], k[1], r["quant"], r["co_episodes"]) for k, r in rels])
                 # чего больше нет в пересчёте (боты, исключённые): удалить; связи с описанием нейросети — оставить
                 await conn.execute("delete from people where not (id = any($1::bigint[]))", list(res.people))
@@ -265,6 +265,18 @@ class DB:
             return await self.pool.fetch("select * from episodes where ended_at <= $1 order by started_at", until)
         return await self.pool.fetch(
             "select * from episodes where ended_at > $1 and ended_at <= $2 order by started_at", after, until)
+
+    async def person_ids(self) -> set[int]:
+        return {r["id"] for r in await self.pool.fetch("select id from people")}
+
+    async def ensure_people(self, users: list[dict]):
+        """Заготовка строки people (досье ссылается на неё); полную запишет выгрузка статистики."""
+        if users:
+            await self.pool.executemany(
+                """insert into people(id, kind, first_name, last_name, username, is_bot, is_premium, is_member)
+                   values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict(id) do nothing""",
+                [(u["id"], u["kind"] or "user", u["first_name"], u["last_name"], u["username"], bool(u["is_bot"]),
+                  bool(u["is_premium"]), bool(u["is_member"])) for u in users])
 
     async def people_brief(self, ids: list[int]) -> dict:
         rows = await self.pool.fetch(

@@ -61,6 +61,16 @@ class LLM:
         self.timeout = timeout
         self._schema_ok = True
 
+    async def count(self, text: str) -> int | None:
+        """Точное число токенов текста (/tokenize у vLLM); None — сервер не умеет или недоступен."""
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                r = await c.post(f"{self.base}/tokenize", json={"model": self.model, "prompt": text,
+                                                                "add_special_tokens": False})
+            return r.json()["count"] if r.status_code == 200 else None
+        except (httpx.HTTPError, KeyError, ValueError):
+            return None
+
     async def chat(self, messages, schema: dict | None = None, *, max_tokens: int = 4096, temperature: float = 0.3,
                    think: bool = False, think_budget: int = 0, audio_in_video: bool = False, retries: int = 2):
         """think_budget — сколько токенов модель может рассуждать; max_tokens — на сам ответ (бюджет добавляется)."""

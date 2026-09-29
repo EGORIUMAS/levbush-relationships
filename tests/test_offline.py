@@ -20,6 +20,7 @@ from levbush.analyze import Analyzer
 from levbush.cache import Cache
 from levbush.config import Config
 from levbush.episodes import segment
+from levbush.llm import LLMError
 from levbush.retell import Retell, md_to_tg
 from levbush.web import auth_user
 
@@ -135,7 +136,7 @@ def test_windows_and_plan(env):
     assert steps == [(0, 3)]          # все три окна закрыты и влезают в один шаг
     an._mark(wins[0], "done")
     assert an.plan(wins, NOW) == [(1, 3)]
-    ctx = an._context(wins, 1)
+    ctx = an._context(wins, 1, 30000)
     assert "Окно #1" in ctx
 
 
@@ -166,6 +167,9 @@ class FakeLLM:
     def __init__(self):
         self.calls = []
 
+    async def count(self, text):
+        return None
+
     async def chat(self, messages, schema=None, **kw):
         self.calls.append((messages, schema, kw))
         return {"windows": [{"id": 1, "summary": "знакомство", "topics": ["привет"], "mood": "тепло"}],
@@ -187,6 +191,12 @@ class FakeDB:
 
     async def people_brief(self, ids):
         return {}
+
+    async def person_ids(self):
+        return {A, B, D, 104}
+
+    async def ensure_people(self, users):
+        self.saved.append(("people", [u["id"] for u in users]))
 
     async def dossier(self, uid):
         return None
@@ -242,6 +252,31 @@ def test_step(env):
     assert "живёт в Саратове — *с " + base_day in md and "https://t.me/c/1234567890/2" in md
     rel = next(x for x in db.saved if x[0] == "relation")
     assert rel[1:5] == (A, B, 0.7, "дружба") and "Боря ответил на приветствие" in rel[5]
+
+
+class TooLongLLM(FakeLLM):
+    """Первый запрос — «не влезает в контекст», дальше как обычно."""
+    async def chat(self, messages, schema=None, **kw):
+        if not self.calls:
+            self.calls.append(None)
+            raise LLMError("HTTP 400: This model's maximum context length is 131072 tokens")
+        return await super().chat(messages, schema, **kw)
+
+
+def test_step_splits_window(env):
+    cfg, cache = env
+    db = FakeDB()
+    an = Analyzer(cfg, cache, db=db, mgr=None)
+    an._llm = TooLongLLM()
+    an._llm.base, an._llm.model = cfg.llm_url, None
+    an.mgr = type("M", (), {"model": None, "url": cfg.llm_url, "fixed_model": "", "label": "Nemotron"})()
+    an.stat = {"dossiers": 0, "relations": 0}
+    an._text_cache, an._tok_cache = {}, {}
+    wins = an.windows(an.load_messages())
+    asyncio.run(an._run_step(wins, 0, 1, NOW))
+    assert len(an._llm.calls) == 3                     # окно целиком не влезло → две половины
+    done = cache.db.execute("select episode_id, last_id from analyzed where status = 'done'").fetchall()
+    assert [tuple(r) for r in done] == [(wins[0].id, wins[0].last_id)]
 
 
 def test_dossier_ops():

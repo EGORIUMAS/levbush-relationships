@@ -113,7 +113,8 @@ DESCRIBE_KIND = {"voice": "голосовое — ТОЛЬКО ЗВУК, изо�
                  "audio": "аудиофайл — только звук", "video_note": "кружок (видео со звуком, фронтальная камера)",
                  "video": "видео", "gif": "GIF — анимация без звука", "document": "файл (видео или звук)"}
 
-CHARS_PER_TOKEN = 2.8     # грубая оценка для русского текста
+CHARS_PER_TOKEN = 2.8     # грубая оценка для нарезки окон и шагов; НЕ менять — от неё зависят id окон
+TOKEN_CHARS = 2.2         # запасная оценка для шапки шага (у Qwen 2,2 знака на токен в досье)
 TOK_FRAME = 700           # кадр видео у Qwen (max_pixels 1 Мпикс): кружок ~300, 720p ~1300
 
 
@@ -137,6 +138,8 @@ class Analyzer:
         self._text_cache: dict = {}
         self._tok_cache: dict = {}
         self._names: dict[int, list[str]] | None = None     # uid → как называют (досье + имя профиля)
+        self._known: set[int] | None = None   # кто есть в people на сервере (досье и связи ссылаются на people)
+        self._stats_memo: dict = {}
         self.stat: dict = {}
         self.on_progress = None       # async def (state) — бот показывает прогресс админу
         self.asr_lock = asyncio.Lock()  # Parakeet — один процесс за раз (~1,2 ГиБ VRAM)
@@ -430,10 +433,9 @@ class Analyzer:
             steps.append((first, last))
         return steps
 
-    def _context(self, wins: list[Episode], first: int) -> str:
-        """Уже разобранные окна за CONTEXT_HOURS до шага (самые свежие, в пределах бюджета)."""
+    def _context(self, wins: list[Episode], first: int, budget: int) -> str:
+        """Уже разобранные окна за CONTEXT_HOURS до шага (самые свежие, не больше budget знаков)."""
         start = wins[first].start
-        budget = self.cfg.step_context_chars
         picked = []
         i = first - 1
         while i >= 0 and budget > 0 and start - wins[i].end <= self.cfg.context_hours * 3600:
@@ -506,7 +508,17 @@ class Analyzer:
                 pairs.add((min(a, b), max(a, b)))
         return pairs
 
+    async def _count(self, text: str) -> int:
+        """Токены текста: точно — у сервера модели, иначе по оценке."""
+        n = await self.llm.count(text)
+        return n if n is not None else int(len(text) / TOKEN_CHARS)
+
     async def _stats_text(self, uid: int) -> str:
+        if uid not in self._stats_memo:                 # шапка шага собирается по нескольку раз
+            self._stats_memo[uid] = await self._stats_text_uncached(uid)
+        return self._stats_memo[uid]
+
+    async def _stats_text_uncached(self, uid: int) -> str:
         p = await self.db.call("api_person", uid)
         if not p:
             return ""
@@ -542,12 +554,13 @@ class Analyzer:
             out.append(f"### {self.r.name(uid)} — " + "; ".join(meta) + "\n" + prompt_person(dossiers.get(uid)))
         return "\n\n".join(out)
 
-    def _relations_block(self, rows, active_pairs: set) -> str:
+    def _relations_block(self, rows, active_pairs: set, full_chars: int) -> str:
+        """Связи; подробно (заметки и события) — только активные пары, пока не набралось full_chars знаков."""
         out, size = [], 0
         for r in sorted(rows, key=lambda r: ((r["a"], r["b"]) not in active_pairs, -(r["strength"] or 0))):
             head = (f"### {self.r.name(r['a']).split(' (@')[0]} (id {r['a']}) ↔ "
                     f"{self.r.name(r['b']).split(' (@')[0]} (id {r['b']})")
-            full = (r["a"], r["b"]) in active_pairs and size < self.cfg.step_relations_chars
+            full = (r["a"], r["b"]) in active_pairs and size < full_chars
             text = head + "\n" + (prompt_relation(r, r["data"]) if full else prompt_relation(r, None))
             size += len(text)
             out.append(text)
@@ -617,14 +630,15 @@ class Analyzer:
             if m["fwd_from_id"] and not m["auto_fwd"]:
                 hits[m["fwd_from_id"]] += 1
         return [uid for uid, _ in hits.most_common()
-                if uid not in writers and self._is_person(uid) and self.cache.user(uid) is not None]
+                if uid not in writers and self._is_person(uid) and self.cache.user(uid) is not None
+                and (self._known is None or uid in self._known)]
 
     async def _roster(self, exclude: set) -> tuple[list[int], str]:
         """Все остальные люди группы одной строкой каждый — чтобы Nemotron мог записать то, что о них сказали заочно."""
         ids = [r[0] for r in self.cache.db.execute(
             """select id from users u where kind = 'user' and not is_bot and (is_member = 1
                or exists (select 1 from messages m where m.sender_id = u.id))""") if r[0] not in exclude]
-        ids = [uid for uid in ids if self._is_person(uid)]
+        ids = [uid for uid in ids if self._is_person(uid) and (self._known is None or uid in self._known)]
         briefs = await self.db.people_brief(ids) if ids else {}
         lines = []
         for uid in ids:
@@ -644,37 +658,48 @@ class Analyzer:
             return
         if self._names is None:
             await self._load_names()
-        discussed = self._discussed(msgs, set(writers))[:self.cfg.step_max_discussed]
-        people = writers + discussed               # у них полные досье: можно add / update / remove
-        roster_ids, roster = await self._roster(set(people))   # остальные: только add и события связей
+        if self._known is None:
+            self._known = await self.db.person_ids()
+        if missing := [uid for uid in writers if uid not in self._known]:
+            await self.db.ensure_people([dict(u) for uid in missing if (u := self.cache.user(uid)) is not None])
+            self._known.update(missing)
+        discussed_all = self._discussed(msgs, set(writers))[:self.cfg.step_max_discussed]
         as_of_ts = new[-1].end
         with_stats = now - as_of_ts < 3 * 86400
-        active = self._interactions(msgs, set(people))
-        context = self._context(wins, first)
         title = self.chat.get("title") or "группа"
         dossiers = {}
-        for uid in people:
+        for uid in writers + discussed_all:
             row = await self.db.dossier(uid)
             dossiers[uid] = row["data"] if row and row["data"].get("entries") is not None else empty_dossier()
-        rel_rows = [dict(r) for r in await self.db.pool.fetch(
-            "select * from relations where a = any($1) and b = any($1) and (summary is not null or data <> '{}')",
-            people)]
-        head = "\n\n".join(x for x in [
-            f"Ты ведёшь досье участников группового Telegram-чата «{title}» и карту их отношений. "
-            "Ниже текущие досье и связи, затем новые окна переписки. Разбери окна и внеси в досье и связи правки.",
-            RULES,
-            "## Участники новых окон и их текущие досье (в квадратных скобках — id записей)\n\n"
-            + await self._people_block(writers, with_stats, dossiers),
-            ("## Кого в новых окнах обсуждают, хотя сами они там не пишут (упоминания, ответы на их старые "
-             "сообщения), — их досье\n\n" + await self._people_block(discussed, with_stats, dossiers))
-            if discussed else "",
-            ("## Остальные люди группы (досье не показаны)\n" + roster) if roster else "",
-            "## Текущие связи между ними\n\n" + (self._relations_block(rel_rows, active) or "Пока не описаны."),
-            ("## Контекст: переписка перед новыми окнами (уже разобрана — только для понимания)\n\n" + context)
-            if context else "",
-            "## Новые окна переписки — разбери их (вложения идут прямо в переписке: фото, видео, кружки и "
-            "голосовые — как есть; у речи есть расшифровка Parakeet)",
-        ] if x)
+        self._stats_memo = {}
+
+        async def build(discussed: list[int], context_chars: int, relations_chars: int):
+            """Шапка запроса: досье всегда целиком, ужимаются контекст, подробности связей и число обсуждаемых."""
+            people = writers + discussed               # у них полные досье: можно add / update / remove
+            roster_ids, roster = await self._roster(set(people))   # остальные: только add и события связей
+            active = self._interactions(msgs, set(people))
+            context = self._context(wins, first, context_chars) if context_chars else ""
+            rel_rows = [dict(r) for r in await self.db.pool.fetch(
+                "select * from relations where a = any($1) and b = any($1) and (summary is not null or data <> '{}')",
+                people)]
+            head = "\n\n".join(x for x in [
+                f"Ты ведёшь досье участников группового Telegram-чата «{title}» и карту их отношений. "
+                "Ниже текущие досье и связи, затем новые окна переписки. Разбери окна и внеси в досье и связи правки.",
+                RULES,
+                "## Участники новых окон и их текущие досье (в квадратных скобках — id записей)\n\n"
+                + await self._people_block(writers, with_stats, dossiers),
+                ("## Кого в новых окнах обсуждают, хотя сами они там не пишут (упоминания, ответы на их старые "
+                 "сообщения), — их досье\n\n" + await self._people_block(discussed, with_stats, dossiers))
+                if discussed else "",
+                ("## Остальные люди группы (досье не показаны)\n" + roster) if roster else "",
+                "## Текущие связи между ними\n\n" + (self._relations_block(rel_rows, active, relations_chars)
+                                                     or "Пока не описаны."),
+                ("## Контекст: переписка перед новыми окнами (уже разобрана — только для понимания)\n\n" + context)
+                if context else "",
+                "## Новые окна переписки — разбери их (вложения идут прямо в переписке: фото, видео, кружки и "
+                "голосовые — как есть; у речи есть расшифровка Parakeet)",
+            ] if x)
+            return head, people, roster_ids, rel_rows
         task = (
             "## Задача\n"
             "Верни только ПРАВКИ — то, что новые окна добавляют или меняют. Ничего не переписывай целиком; если "
@@ -718,25 +743,38 @@ class Analyzer:
             "каждая шутка, перепалка или обмен репликами.\n"
             "- relation_notes — заменить заметку о связи: section how (как общаются), bond (что их связывает), "
             "dynamics (к чему идёт) — 1–3 предложения.\n" + STEP_FORMAT)
+        budget = self.budget(self.cfg.step_tokens)
+        blocks = [(f"=== Окно #{w.id}, {self._span(w)} ===", w.msgs) for w in new]
+        window = await asyncio.to_thread(self.interleave, blocks, budget)
+        media_tokens = self.cfg.step_tokens - budget.tokens
+        fixed = await self._count("\n\n".join(p["text"] for p in window if p["type"] == "text") + "\n\n" + task)
+        fixed += int(media_tokens * 1.1)                # вложения — по оценке, с запасом
+        max_tokens = 12000                              # правки — не романы; зацикливание обрывается раньше
+        cap = self.ctx - max_tokens - (self.cfg.llm_think_budget if self.cfg.llm_think else 0) - 2000
+        full_ctx, full_rel, n = self.cfg.step_context_chars, self.cfg.step_relations_chars, len(discussed_all)
+        levels = [(n, full_ctx, full_rel), (n, full_ctx // 3, full_rel // 3),      # после этого — делить шаг
+                  (n, 0, 0), (n // 2, 0, 0), (0, 0, 0)]                           # одно окно: ужимать шапку
+        for lvl, (nd, ctx_chars, rel_chars) in enumerate(levels):
+            head, people, roster_ids, rel_rows = await build(discussed_all[:nd], ctx_chars, rel_chars)
+            est = await self._count(head) + fixed
+            if est <= cap:
+                break
+            if lvl == 1 and last - first > 1:
+                raise _TooBig()
+        else:
+            raise _TooBig()
+        if lvl:
+            log.info("шаг #%s ужат до уровня %d: оценка %d ток.", new[0].id, lvl, est)
         entry_ids = [e["id"] for uid in people for e in dossiers[uid]["entries"] if not e["removed"]]
         msg_ids = [m["id"] for m in msgs]
         schema = step_schema([w.id for w in new], people, roster_ids, entry_ids, msg_ids)
-        budget = self.budget(self.cfg.step_tokens)
-        blocks = [(f"=== Окно #{w.id}, {self._span(w)} ===", w.msgs) for w in new]
-        content = [L.text(head)] + await asyncio.to_thread(self.interleave, blocks, budget) + [L.text(task)]
-        chars = sum(len(p["text"]) for p in content if p["type"] == "text")
-        media_tokens = self.cfg.step_tokens - budget.tokens
-        est = int(chars / CHARS_PER_TOKEN) + media_tokens
-        room = self.ctx - est - 1000 - (self.cfg.llm_think_budget if self.cfg.llm_think else 0)
-        if room < 6000 and last - first > 1:
-            raise _TooBig()
-        max_tokens = max(4000, min(12000, room))      # правки — не романы; зацикливание обрывается раньше
+        content = [L.text(head)] + window + [L.text(task)]
         try:
             out = await self.llm.chat([{"role": "user", "content": content}], schema, max_tokens=max_tokens,
                                       think=self.cfg.llm_think, think_budget=self.cfg.llm_think_budget,
                                       audio_in_video=budget.audio_in_video)
         except L.LLMError as exc:
-            if last - first > 1:
+            if last - first > 1 or "maximum context length" in str(exc):
                 raise _TooBig() from exc
             if media_tokens:
                 log.warning("окно #%s с вложениями не прошло (%s) — повторяю без вложений", new[0].id, exc)
@@ -834,13 +872,27 @@ class Analyzer:
             (w.id, w.last_id, status, error, int(time.time())))
 
     async def _run_step(self, wins, first, last, now):
-        """Шаг; если не влез в контекст — делим пополам."""
+        """Шаг; если не влез в контекст — делим пополам: сначала по окнам, одно окно — по сообщениям."""
         try:
             await self.step(wins, first, last, now)
         except _TooBig:
-            mid = (first + last) // 2
-            await self._run_step(wins, first, mid, now)
-            await self._run_step(wins, mid, last, now)
+            if last - first > 1:
+                mid = (first + last) // 2
+                await self._run_step(wins, first, mid, now)
+                await self._run_step(wins, mid, last, now)
+                return
+            w = wins[first]
+            if len(w.msgs) < 2:
+                raise RuntimeError(f"окно #{w.id} не влезает в контекст даже одним сообщением") from None
+            k = len(w.msgs) // 2
+            halves = [Episode(w.msgs[:k], w.alias), Episode(w.msgs[k:], w.alias)]
+            log.info("окно #%s (%d сообщ.) не влезает вместе с досье — разбираю по половинам", w.id, len(w.msgs))
+            sub = wins[:first] + halves + wins[first + 1:]
+            await self._run_step(sub, first, first + 1, now)
+            await self._run_step(sub, first + 1, first + 2, now)
+            # отметка — за окно целиком (первая половина записана под тем же id, её перекроет)
+            self.cache.db.execute("delete from analyzed where episode_id = ?", (halves[1].id,))
+            self._mark(w, "done")
 
     # ================================================================ прогон
 
@@ -852,6 +904,7 @@ class Analyzer:
         self.stat = {"transcribed": 0, "described": 0, "windows": 0, "steps": 0, "dossiers": 0, "relations": 0}
         self._text_cache, self._tok_cache = {}, {}
         self._names = None                       # указатель имён перечитывается из досье в начале прогона
+        self._known = None
         self.cache.set("analysis_running", reason)       # перезапуск бота посреди разбора — продолжит сам
         try:
             self.state = {"state": "running", "reason": reason, "started": int(started)}
@@ -918,10 +971,8 @@ class Analyzer:
             except Exception:  # noqa: BLE001
                 pass
             raise
-        except Exception:
-            self.cache.set("analysis_running", None)
-            raise
         except Exception as exc:
+            self.cache.set("analysis_running", None)
             self.state = {"state": "error", "error": str(exc)[:500], "updated": int(time.time())}
             await self.db.set_pass(self.state)
             await self._say(f"❌ Разбор упал: {exc}")

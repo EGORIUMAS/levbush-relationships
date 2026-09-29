@@ -1217,7 +1217,7 @@
       if (chips) out += `<div class="chips">${chips}</div>`;
       out += `<dl class="kv">
           <div><dt>По активности</dt><dd>${fmtS(rel.quant)}</dd></div>
-          <div><dt>Оценка нейросети</dt><dd>${fmtS(rel.llm_score)}</dd></div>
+          <div><dt>Оценка нейросети</dt><dd>${fmtS(rel.llm_score ?? 0)}</dd></div>
           <div><dt>Обновлено</dt><dd>${esc(rel.updated_at ? fmtDateShort(rel.updated_at) : '—')}</dd></div></dl>`;
       if (rel.summary) out += `<p class="lead">${esc(rel.summary)}</p>`;
     } else if (gl && (gl.kind || gl.tone)) {
