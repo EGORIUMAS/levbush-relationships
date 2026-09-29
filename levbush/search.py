@@ -59,6 +59,13 @@ STOP = set("""и в во не что он на я с со как а то все 
 
 # «фото еды», «скрин переписки»: ищут картинку — эти слова не ищем в тексте, а поднимаем вектор картинок
 PICTURE_STEMS = {"фот", "фотк", "фотограф", "картинк", "скрин", "скриншот", "пикч", "изображен", "снимк", "снимок"}
+# слова о виде вложения («кружок с арбузом», «видео с котом») — не ищутся как текст, а поднимают такие сообщения
+KIND_STEMS = {"кружок": ("video_note",), "кружк": ("video_note",), "кружочек": ("video_note",),
+              "кругляш": ("video_note",), "видеосообщен": ("video_note",),
+              "виде": ("video", "video_note", "gif"), "видос": ("video", "video_note"), "видосик": ("video", "video_note"),
+              "ролик": ("video",), "гиф": ("gif",), "гифк": ("gif",), "gif": ("gif",),
+              "голосов": ("voice",), "голосовух": ("voice",), "гс": ("voice",), "войс": ("voice",)}
+KIND_BOOST = 2.0
 
 
 def _sig(text: str) -> str:
@@ -79,10 +86,15 @@ class Stemmer:
     def words(self, text: str) -> list[str]:
         return re.findall(r"\w+", (text or "").lower().replace("ё", "е"))
 
+    # Snowball сводит «есть» (быть) к «ест» — и «Вика ест арбуз» совпадал с тысячами «есть»
+    KEEP = {"есть"}
+
     def stem(self, w: str) -> str:
         s = self._cache.get(w)
         if s is None:
-            if re.search(r"[а-я]", w):
+            if w in self.KEEP:
+                s = w
+            elif re.search(r"[а-я]", w):
                 s = self.ru.stemWord(w)
             elif re.fullmatch(r"[a-z]+", w):
                 s = self.en.stemWord(w)
@@ -359,6 +371,16 @@ class Indexer:
 
     def _sync(self, chunk: int) -> dict:
         self.r = Renderer(self.cache, self.cfg)          # псевдонимы и чат могли смениться
+        if self.sdb.meta("fts_ver") != "2":
+            # сменились основы слов (Stemmer.KEEP) — полнотекстовый индекс заново по сохранённым документам
+            rows = self.sdb.db.execute("select msg_id, body from items where body <> ''").fetchall()
+            for k in range(0, len(rows), 5000):
+                with self.sdb.tx() as db:
+                    for r in rows[k:k + 5000]:
+                        db.execute("delete from fts where rowid = ?", (r["msg_id"],))
+                        db.execute("insert into fts(rowid, body) values (?, ?)", (r["msg_id"], self.stem.text(r["body"])))
+            self.sdb.set_meta("fts_ver", "2")
+            log.info("поиск: полнотекстовый индекс пересобран (%d)", len(rows))
         if self.sdb.meta("videos") != "1":
             # видео, кружки и GIF стали индексироваться кадрами — пересобрать их записи (штамп сброшен)
             ids = [r[0] for r in self.cache.db.execute(
@@ -714,10 +736,18 @@ class Searcher:
             if w in STOP or len(w) < 2 or w in skip:
                 continue
             s = self.stem.stem(w)
-            if s in PICTURE_STEMS and self.wants_picture(q):
+            if s in PICTURE_STEMS and self.wants_picture(q) or s in KIND_STEMS and self.kinds(q):
                 continue
             parts.append(f'"{s}"*' if len(s) >= 4 else f'"{s}"')
         return " OR ".join(dict.fromkeys(parts)) or None
+
+    def kinds(self, q: Query) -> set[str]:
+        """Виды вложений, названные в запросе вместе с чем-то ещё («кружок с арбузом» → video_note)."""
+        stems = [self.stem.stem(w) for w in self.stem.words(q.text) if w not in STOP]
+        named = [s for s in stems if s in KIND_STEMS]
+        if not named or len(named) == len(stems):
+            return set()
+        return {k for s in named for k in KIND_STEMS[s]}
 
     def wants_picture(self, q: Query) -> bool:
         """В запросе «фото/картинка/скрин» и есть что-то ещё: ищут картинку, а не само слово «фото»."""
@@ -804,6 +834,12 @@ class Searcher:
                 h = scores.setdefault(mid, Hit(mid, 0.0, set()))
                 h.score += weights[kind] / (RRF_K + rank + 1)
                 h.via.add(kind.removesuffix("_p"))
+        kinds = self.kinds(q)
+        if kinds:
+            for h in scores.values():
+                m = self.cache.db.execute("select media from messages where id = ?", (h.msg_id,)).fetchone()
+                if m is not None and m[0] in kinds:
+                    h.score *= KIND_BOOST
         hits = sorted(scores.values(), key=lambda h: -h.score)
         # альбом — одной строкой; удалённые (если индекс ещё не догнал) — мимо
         out, albums = [], set()

@@ -369,6 +369,8 @@ def test_video_frames_and_named_person(env):
     q, hits, _ = asyncio.run(svc.find("Боря ест арбуз", datetime.fromtimestamp(NOW, cfg.tz), names=names))
     ids = [h.msg_id for h in hits]
     assert q.people == [B] and q.name_words == {"Боря"} and ids.index(11) < ids.index(12)
+    # «кружок с арбузом»: вид вложения не ищется словом, а поднимает кружки
+    assert find(svc, "кружок с арбузом")[0] == 11
     # удалили — кадры уходят вместе с сообщением
     cache.db.execute("update messages set deleted = 1 where id = 11")
     svc.indexer.sync()
