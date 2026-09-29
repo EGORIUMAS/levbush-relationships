@@ -65,7 +65,7 @@ KIND_STEMS = {"кружок": ("video_note",), "кружк": ("video_note",), "�
               "виде": ("video", "video_note", "gif"), "видос": ("video", "video_note"), "видосик": ("video", "video_note"),
               "ролик": ("video",), "гиф": ("gif",), "гифк": ("gif",), "gif": ("gif",),
               "голосов": ("voice",), "голосовух": ("voice",), "гс": ("voice",), "войс": ("voice",)}
-KIND_BOOST = 2.0
+KIND_BOOST = 3.0
 
 
 def _sig(text: str) -> str:
