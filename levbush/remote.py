@@ -138,7 +138,7 @@ class DB:
                         [(k[0], k[1], c) for k, c in pairs])
                 if rels:
                     await conn.executemany(
-                        """insert into relations(a, b, quant, co_episodes, strength) values ($1, $2, $3, $4, 0.4 * $3)
+                        """insert into relations(a, b, quant, co_episodes, strength) values ($1, $2, $3::real, $4, 0.4 * $3::real)
                            on conflict(a, b) do update set quant=excluded.quant, co_episodes=excluded.co_episodes,
                                strength = 0.4 * excluded.quant + 0.6 * coalesce(relations.llm_score, 0)""",
                         [(k[0], k[1], r["quant"], r["co_episodes"]) for k, r in rels])
