@@ -123,6 +123,10 @@ class Config:
     step_max_windows: int = field(default_factory=lambda: env_int("STEP_MAX_WINDOWS", 8))
     step_max_discussed: int = field(default_factory=lambda: env_int("STEP_MAX_DISCUSSED", 6))  # обсуждаемые заочно — с досье
     step_max_people: int = field(default_factory=lambda: env_int("STEP_MAX_PEOPLE", 10))
+    # досье разрослось (записей или знаков больше порога) — Qwen сжимает его в биографию перед шагом;
+    # после сжатия обычно 40–55 записей и 7–13 тыс. знаков — порог с запасом, чтобы не пережимать каждые пару шагов
+    dossier_max_entries: int = field(default_factory=lambda: env_int("DOSSIER_MAX_ENTRIES", 90))
+    dossier_max_chars: int = field(default_factory=lambda: env_int("DOSSIER_MAX_CHARS", 20000))
     # медиа в запросе: лимиты (= --limit-mm-per-prompt сервера) и оценка токенов для планирования
     mm_images: int = field(default_factory=lambda: env_int("MM_IMAGES", 24))
     mm_videos: int = field(default_factory=lambda: env_int("MM_VIDEOS", 6))

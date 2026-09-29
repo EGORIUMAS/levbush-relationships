@@ -20,8 +20,8 @@ from pathlib import Path
 from . import llm as L
 from .cache import Cache
 from .config import ROOT, Config
-from .dossier import (REL_NOTES, SECTIONS, apply_person, apply_relation, empty_dossier, empty_relation, norm_name,
-                      prompt_person, prompt_relation, render_person, render_relation)
+from .dossier import (REL_NOTES, SECTIONS, apply_person, apply_relation, compact_person, empty_dossier, empty_relation,
+                      norm_name, prompt_person, prompt_relation, render_person, render_relation)
 from .episodes import Episode, is_closed, segment
 from .gpu import LLMManager
 from .media import Media, is_av
@@ -96,6 +96,37 @@ person, a, b — id людей; msgs — номера сообщений (#25356
 Все тексты в JSON — ТОЛЬКО на русском языке."""
 
 
+COMPACT = """Ниже досье участника группового Telegram-чата «{title}» — {name}. Оно разрослось: много мелких записей в духе
+дневника, повторы, одно и то же разными словами. Сожми его в настоящее досье — биографию и портрет человека.
+
+Правила:
+- Объединяй повторы и близкие записи в одну. Если что-то менялось со временем — одна запись с итогом
+  («учился в X, с сентября 2026 — в Y»).
+- Одноразовые события дня (был на паре, что ел, во что был одет, что выложил или переслал) обобщи в черту или
+  привычку, если таких много («часто ходит на олимпиадные кружки»), а если они ничего не говорят о человеке — выбрось
+  (dropped).
+- Колоритные мелочи и привычки (quirks) — ценное, их сохраняй: любимое, словечки, фишки, питомцы, режим дня.
+- Даты в тексте не пиши, кроме значимых событий (timeline) и «с какого года».
+- Ничего не выдумывай — только то, что есть в записях. Пометки «со слов …», «судя по …» сохраняй.
+- Ориентир: who 1–2, facts (биография) до 15, interests до 10, character до 8, quirks до 12, role до 3, timeline до 10
+  значимых событий жизни. Всего обычно 30–50 записей.
+- Каждый id старой записи — ровно в одном месте: в from одной из новых записей или в dropped.
+- basis новой записи: «сам», если хоть одна исходная — «сам»; иначе «косвенно» или «со слов других».
+Всё — по-русски.
+
+Досье (в квадратных скобках — id записей):
+{dossier}"""
+
+
+def compact_schema(ids: list[str]) -> dict:
+    some = {"type": "array", "items": {"type": "string", "enum": ids}}
+    return {"type": "object", "additionalProperties": False, "required": ["entries", "dropped"], "properties": {
+        "entries": _arr({"section": {"type": "string", "enum": list(SECTIONS)}, "text": _str(400),
+                         "basis": {"type": "string", "enum": ["сам", "косвенно", "со слов других"]},
+                         "from": some}, 80),
+        "dropped": some}}
+
+
 SERVED_NEMOTRON = "nemotron3-nano-omni"
 DESCRIBE = """Это вложение из группового Telegram-чата. Сообщение с ним (если во вложении есть речь, её расшифровка
 Parakeet — в квадратных скобках после «расшифровка:»; Parakeet понимает русский, опирайся на неё):
@@ -140,6 +171,7 @@ class Analyzer:
         self._names: dict[int, list[str]] | None = None     # uid → как называют (досье + имя профиля)
         self._known: set[int] | None = None   # кто есть в people на сервере (досье и связи ссылаются на people)
         self._stats_memo: dict = {}
+        self._compact_failed: set[int] = set()
         self.stat: dict = {}
         self.on_progress = None       # async def (state) — бот показывает прогресс админу
         self.asr_lock = asyncio.Lock()  # Parakeet — один процесс за раз (~1,2 ГиБ VRAM)
@@ -648,6 +680,52 @@ class Analyzer:
                          + (f" — {s}" if s else ""))
         return ids, "\n".join(lines)
 
+    # ================================================================ сжатие досье
+
+    def _too_big(self, data: dict | None, uid: int) -> bool:
+        if uid in self._compact_failed:                 # в этом прогоне уже не вышло — не тратить время снова
+            return False
+        live = [e for e in (data or {}).get("entries", []) if not e["removed"]]
+        return (len(live) > self.cfg.dossier_max_entries
+                or sum(len(e["text"]) + 40 for e in live) > self.cfg.dossier_max_chars)
+
+    async def compact(self, uid: int, data: dict) -> int:
+        """Сжать разросшееся досье (правит data и сохраняет). Возвращает, на сколько записей стало меньше."""
+        live = [e for e in data["entries"] if not e["removed"]]
+        prompt = COMPACT.format(title=self.chat.get("title") or "группа", name=self.r.name(uid),
+                                dossier=prompt_person(data))
+        t = time.time()
+        try:
+            out = await self.llm.chat([{"role": "user", "content": prompt}], compact_schema([e["id"] for e in live]),
+                                      max_tokens=12000, think=self.cfg.llm_think,
+                                      think_budget=self.cfg.llm_think_budget)
+        except L.LLMError as exc:
+            self._compact_failed.add(uid)
+            log.warning("досье %s не сжалось: %s", uid, exc)
+            return 0
+        today = datetime.now(self.cfg.tz).strftime("%Y-%m-%d")
+        n = compact_person(data, out, today)
+        if not n:
+            self._compact_failed.add(uid)
+            refs = {i for e in out.get("entries", []) for i in e.get("from") or []}
+            log.warning("досье %s не сжалось (записей %d, в ответе %d новых из %d старых, выброшено %d) — оставлено как "
+                        "было", uid, len(live), len(out.get("entries", [])), len(refs), len(out.get("dropped", [])))
+            return 0
+        row = await self.db.dossier(uid)
+        await self.db.save_dossier(uid, row["as_of"], data.get("summary") or None, render_person(data, self.chat), data)
+        log.info("досье %s сжато за %.0f с: %d → %d записей", uid, time.time() - t, len(live), len(live) - n)
+        return n
+
+    async def compact_all(self):
+        """Перед шагами: сжать все досье, что переросли порог."""
+        rows = [r for r in await self.db.pool.fetch("select user_id, data from dossiers where data ? 'entries'")
+                if self._too_big(r["data"], r["user_id"])]
+        for i, r in enumerate(rows):
+            await self._progress(stage=f"сжатие досье ({self.thinker.label})", done=i, total=len(rows), eta=None,
+                                 step_date=None)
+            if await self.compact(r["user_id"], r["data"]):
+                self.stat["compacted"] = self.stat.get("compacted", 0) + 1
+
     async def step(self, wins: list[Episode], first: int, last: int, now: int):
         new = wins[first:last]
         msgs = [m for w in new for m in w.msgs]
@@ -671,6 +749,8 @@ class Analyzer:
         for uid in writers + discussed_all:
             row = await self.db.dossier(uid)
             dossiers[uid] = row["data"] if row and row["data"].get("entries") is not None else empty_dossier()
+            if self._too_big(dossiers[uid], uid) and await self.compact(uid, dossiers[uid]):
+                self.stat["compacted"] = self.stat.get("compacted", 0) + 1
         self._stats_memo = {}
 
         async def build(discussed: list[int], context_chars: int, relations_chars: int):
@@ -718,7 +798,7 @@ class Analyzer:
             "спросил; отдельные шутки, мемы, реплики, бытовые мелочи дня (что ел, что смотрел), пересказ разговора. "
             "Запись должна быть верной и полезной и через полгода. Прежде чем добавить, посмотри досье: похожая "
             "запись есть — уточни её через update, а не добавляй вторую. Обычно 0–3 записи на человека за шаг. "
-            "Одна мысль — одна запись, коротко. basis — на чём основано: «сам» (сам сказал или показал), "
+            "Одна мысль — одна запись, коротко. Дату в текст не пиши — она ставится сама. basis — на чём основано: «сам» (сам сказал или показал), "
             "«косвенно» (твой вывод — в тексте укажи, из чего), «со слов других».\n"
             "- update — запись изменилась или уточнилась: entry — её id (e12), text — новый текст, why — что "
             "произошло (например «переехал»). Старый текст и дата изменения сохранятся сами.\n"
@@ -905,6 +985,7 @@ class Analyzer:
         self._text_cache, self._tok_cache = {}, {}
         self._names = None                       # указатель имён перечитывается из досье в начале прогона
         self._known = None
+        self._compact_failed = set()
         self.cache.set("analysis_running", reason)       # перезапуск бота посреди разбора — продолжит сам
         try:
             self.state = {"state": "running", "reason": reason, "started": int(started)}
@@ -926,6 +1007,9 @@ class Analyzer:
             await self._progress(stage=f"шаги разбора ({self.thinker.label})", done=0, total=len(steps), eta=None,
                                  step_date=None)
             async with self.thinker.use():
+                await self.compact_all()
+                await self._progress(stage=f"шаги разбора ({self.thinker.label})", done=0, total=len(steps),
+                                     eta=None, step_date=None)
                 for i, (a, b) in enumerate(steps, 1):
                     when = datetime.fromtimestamp(wins[a].start, self.cfg.tz)
                     await self._progress(done=i - 1, step_date=f"{when:%Y-%m-%d}",
@@ -958,7 +1042,9 @@ class Analyzer:
             await self._say(f"✅ Разбор готов за {(time.time() - started) / 60:.0f} мин: окон {self.stat['windows']}, "
                             f"шагов {self.stat['steps']}, расшифровок "
                             f"{self.stat['transcribed']}, описаний медиа {self.stat['described']}, правок досье {self.stat['dossiers']}, связей "
-                            f"{self.stat['relations']}" + (f". Окон с ошибкой: {errors} — повторю в следующий раз"
+                            f"{self.stat['relations']}"
+                            + (f", сжато досье {self.stat['compacted']}" if self.stat.get("compacted") else "")
+                            + (f". Окон с ошибкой: {errors} — повторю в следующий раз"
                                                           if errors else ""))
             self.cache.db.execute("delete from analyzed where status = 'error'")
             self.cache.set("analysis_running", None)

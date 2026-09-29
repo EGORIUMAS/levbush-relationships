@@ -101,6 +101,37 @@ def apply_person(data: dict, ops: dict, uid: int, day_of) -> int:
     return n
 
 
+BASES = ("сам", "косвенно", "со слов других")
+
+
+def compact_person(data: dict, out: dict, today: str) -> int:
+    """Сжатие досье: новые записи из ответа заменяют старые, из которых собраны (from); dropped — выброшены,
+    не упомянутые нигде — остаются как были. Старые записи уходят в data["archive"]. Возвращает, сколько стало
+    записей меньше (0 — ответ негодный, досье не тронуто)."""
+    live = {e["id"]: e for e in data["entries"] if not e["removed"]}
+    used, new = set(), []
+    for item in out.get("entries", []):
+        src = [live[i] for i in dict.fromkeys(item.get("from") or []) if i in live and i not in used]
+        if not src or not item.get("text") or item.get("section") not in SECTIONS:
+            continue                                      # запись ни из чего — выдумка
+        used.update(e["id"] for e in src)
+        basis = item["basis"] if item.get("basis") in BASES else _basis(src[0])
+        new.append({"id": "", "section": item["section"], "text": clean(item["text"]),
+                    "since": min(e["since"] for e in src), "changed": None, "prev": None,
+                    "msgs": list(dict.fromkeys(m for e in src for m in e["msgs"]))[:8], "basis": basis,
+                    "certain": basis == "сам", "removed": None, "why": None})
+    dropped = {i for i in out.get("dropped", []) if i in live} - used
+    kept = [e for i, e in live.items() if i not in used and i not in dropped]
+    if len(new) + len(kept) > len(live) * 0.9:           # почти не сжалось — не трогаем
+        return 0
+    for e in new:
+        e["id"] = f"e{data['next']}"
+        data["next"] += 1
+    data.setdefault("archive", []).append({"at": today, "entries": [live[i] for i in live if i in used | dropped]})
+    data["entries"] = [e for e in data["entries"] if e["removed"]] + kept + new
+    return len(live) - len(new) - len(kept)
+
+
 def apply_relation(data: dict, ops: dict, a: int, b: int, day_of) -> int:
     n = 0
     pair = {a, b}

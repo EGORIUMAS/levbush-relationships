@@ -563,3 +563,21 @@ def test_basis_marks():
     apply_person(d, {"update": [{"person": 1, "entry": "e2", "text": "переехал в Казань", "msgs": [], "why": "подтвердил",
                                  "basis": "сам"}]}, 1, day)
     assert d["entries"][1]["basis"] == "сам" and d["entries"][1]["certain"]
+
+
+def test_compact_person():
+    from levbush.dossier import apply_person, compact_person, empty_dossier
+    d = empty_dossier()
+    day = lambda msgs: "2025-0%d-01" % msgs[0]  # noqa: E731
+    apply_person(d, {"add": [{"person": 1, "section": "facts", "text": t, "msgs": [i], "basis": b}
+                             for i, (t, b) in enumerate([("учится в школе", "сам"), ("ходит в школу", "косвенно"),
+                                                         ("был на паре", "сам"), ("пьёт квас", "сам")], 1)]}, 1, day)
+    bad = {"entries": [{"section": "facts", "text": "выдумка", "basis": "сам", "from": []}], "dropped": []}
+    assert compact_person(d, bad, "2025-09-01") == 0 and len(d["entries"]) == 4
+    out = {"entries": [{"section": "facts", "text": "школьник", "basis": "сам", "from": ["e1", "e2"]}],
+           "dropped": ["e3"]}
+    assert compact_person(d, out, "2025-09-01") == 2
+    texts = {e["text"]: e for e in d["entries"]}
+    assert set(texts) == {"пьёт квас", "школьник"}                       # e4 не упомянута — осталась
+    assert texts["школьник"]["since"] == "2025-01-01" and texts["школьник"]["msgs"] == [1, 2]
+    assert texts["школьник"]["id"] == "e5" and [e["id"] for e in d["archive"][0]["entries"]] == ["e1", "e2", "e3"]
