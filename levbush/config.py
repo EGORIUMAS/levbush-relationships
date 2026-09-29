@@ -106,12 +106,16 @@ class Config:
     qwen_url: str = field(default_factory=lambda: env("QWEN_URL", "http://127.0.0.1:18091").rstrip("/"))
     qwen_model_path: str = field(default_factory=lambda: env("QWEN_MODEL_PATH", "/mnt/shared/Models/qwen38-27b-nvfp4"))
     qwen_name: str = field(default_factory=lambda: env("QWEN_NAME", "qwen3.8-27b"))
-    qwen_ctx: int = field(default_factory=lambda: env_int("QWEN_CTX", 131072))
+    # KV TurboQuant k8v4 при 0,92 VRAM вмещает ~192k токенов (fp8 — 153k); 176k — с запасом
+    qwen_ctx: int = field(default_factory=lambda: env_int("QWEN_CTX", 180224))
     qwen_util: float = field(default_factory=lambda: env_float("QWEN_UTIL", 0.92))
     # 1 слот: при двух запросах с картинками и MTP vLLM 0.27.1 падает (cudaErrorIllegalAddress); пересказ во время
     # разбора встаёт в очередь за текущим шагом
     qwen_seqs: int = field(default_factory=lambda: env_int("QWEN_SEQS", 1))
-    qwen_mtp: int = field(default_factory=lambda: env_int("QWEN_MTP", 3))          # 0 — без MTP; с MTP только fp8 KV
+    qwen_mtp: int = field(default_factory=lambda: env_int("QWEN_MTP", 3))          # 0 — без MTP
+    # KV-кэш Qwen: TurboQuant с MTP работает только с патчем vLLM (deploy/vllm-0.27.1-turboquant-mtp.patch),
+    # без патча — fp8 (и QWEN_CTX не больше 150k)
+    qwen_kv: str = field(default_factory=lambda: env("QWEN_KV", "turboquant_k8v4"))
     qwen_need_gib: float = field(default_factory=lambda: env_float("QWEN_NEED_GIB", 29.0))   # 0,92 × 31,4
     video_frames: int = field(default_factory=lambda: env_int("VIDEO_FRAMES", 4))  # кадров видео/GIF для Qwen
     qwen_images: int = field(default_factory=lambda: env_int("QWEN_IMAGES", 40))   # картинок в одном запросе к Qwen

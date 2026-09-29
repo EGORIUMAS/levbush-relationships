@@ -160,12 +160,13 @@ class LLMManager:
                    "--mm-processor-kwargs", json.dumps({"max_pixels": 1048576}),
                    # без кэша префиксов: с ним MTP на запросах с картинками в vLLM 0.27.1 зависает (генерация 0 ток/с)
                    "--no-enable-prefix-caching", "--reasoning-parser", "qwen3", *common]
+            cmd += ["--kv-cache-dtype", cfg.qwen_kv]
+            if cfg.qwen_kv.startswith("turboquant"):
+                # групповому декод-ядру из патча нужно 64 куска KV (при 32 одному запросу мало программ на GPU)
+                cmd += ["--attention-config.tq_max_kv_splits_for_cuda_graph=64"]
             if cfg.qwen_mtp:
-                # MTP только с fp8 KV: с TurboQuant vLLM 0.27.1 молча портит вывод (vllm#53180)
-                cmd += ["--kv-cache-dtype", "fp8", "--speculative-config",
-                        json.dumps({"method": "mtp", "num_speculative_tokens": cfg.qwen_mtp})]
-            else:
-                cmd += ["--kv-cache-dtype", "turboquant_k8v4"]
+                # с TurboQuant — только с патчем vLLM (без него FULL CUDA graph портит вывод, vllm#53180)
+                cmd += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": cfg.qwen_mtp})]
             return head + cmd
         return head + [
             vllm, "serve", cfg.llm_model_path, "--served-model-name", SERVED_NAME, "--trust-remote-code",
