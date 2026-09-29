@@ -103,6 +103,7 @@ class Levbush:
                 self.search = SearchService(config, self.cache)
             except Exception:  # noqa: BLE001 — без поиска бот работает как раньше
                 log.exception("поиск не запустился")
+        self.names_loaded = 0.0                    # когда /find перечитал имена из досье
         self.finds: dict[str, dict] = {}          # выдачи /find для листания кнопками (в памяти, до 1 ч)
 
     # ================================================================ служебное
@@ -1107,7 +1108,7 @@ class Levbush:
         try:
             if time.time() - int(self.search.sdb.meta("synced") or 0) > 60:
                 await asyncio.to_thread(self.search.indexer.sync)      # свежие сообщения — в полнотекстовый
-            q, hits, semantic = await self.search.find(raw, datetime.now(self.cfg.tz))
+            q, hits, semantic = await self.search.find(raw, datetime.now(self.cfg.tz), names=await self.name_index())
         except Exception as exc:  # noqa: BLE001
             log.exception("поиск")
             text = f"❌ Поиск не удался: {esc(exc)}"
@@ -1131,6 +1132,18 @@ class Levbush:
             await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=markup)
         else:
             await self.reply(update, text, markup)
+
+    async def name_index(self):
+        """Кто назван в тексте по имени из досье («Вика», «Лёвы») — указатель разбора; раз в час перечитывается."""
+        an = self.analyzer
+        if an._names is None or (not an.running and time.time() - self.names_loaded > 3600):
+            try:
+                await an._load_names()
+                self.names_loaded = time.time()
+            except Exception:  # noqa: BLE001
+                log.exception("имена из досье для поиска")
+                return None
+        return an._name_hits
 
     def find_page(self, key: str, page: int):
         f = self.finds[key]

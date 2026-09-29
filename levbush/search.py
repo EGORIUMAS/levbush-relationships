@@ -40,8 +40,11 @@ BODY_LIMIT = 4000           # знаков документа в индексе;
 RRF_K = 60
 # косинус запроса с документом, ниже которого вектор в выдачу не берётся: у текста хорошие совпадения 0,4–0,65, у фото
 # (другая модальность) — 0,25–0,3 при 0,15–0,2 у случайных (замер на истории группы)
-MIN_SIM = {"text": 0.25, "image": 0.22}
-WEIGHTS = {"text": 1.0, "fts": 1.0, "image": 0.8}
+MIN_SIM = {"text": 0.25, "image": 0.22, "frame": 0.19}   # кадр видео: чужие ~0,13–0,15, свой ~0,2–0,35
+WEIGHTS = {"text": 1.0, "fts": 1.0, "image": 0.8,
+           # то же среди сообщений человека, названного в запросе по имени («Вика ест арбуз»): сильный сигнал —
+           # его кружок с арбузом выше чужих сообщений со словом «арбуз»
+           "text_p": 1.5, "fts_p": 1.5, "image_p": 1.5}
 ICONS = {"photo": "📷", "video": "🎬", "video_note": "⭕", "voice": "🎤", "audio": "🎵", "gif": "🎞",
          "document": "📄", "sticker": "🌀", "poll": "📊", "webpage": "🔗", "location": "📍"}
 # служебные слова — в полнотекстовый запрос не идут (вектору они не мешают)
@@ -129,16 +132,26 @@ def document(m, transcript: str | None, desc: str | None) -> str:
     return "\n".join(parts).strip()[:BODY_LIMIT]
 
 
+VIDEO_KINDS = ("video", "video_note", "gif")
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
+
+
+def is_video(path: str | None) -> bool:
+    return bool(path) and path.lower().endswith(VIDEO_EXT)
+
+
 def image_of(m) -> str | None:
-    """Путь к картинке сообщения для векторного индекса: фото и картинки-файлы (стикеры — нет, их тысячи
-    одинаковых; видео и GIF описаны Nemotron'ом текстом)."""
+    """Путь к картинке сообщения для векторного индекса: фото, картинки-файлы, а также видео, кружки и GIF — их
+    воркер режет на кадры (вектор на кадр, сходство — по лучшему кадру: арбуз в первые секунды кружка иначе
+    размывается). Стикеры — нет, их тысячи одинаковых."""
     if m["media_state"] != "ok" or not m["media_path"]:
         return None
     meta = json.loads(m["media_meta"]) if m["media_meta"] else {}
-    if m["media"] == "photo" or (m["media"] == "document" and (meta.get("mime") or "").startswith("image/")
-                                 and not (meta.get("mime") or "").endswith("gif")):
-        return m["media_path"] if Path(m["media_path"]).exists() else None
-    return None
+    mime = meta.get("mime") or ""
+    picture = m["media"] == "photo" or m["media"] == "document" and mime.startswith("image/") and not mime.endswith("gif")
+    video = (m["media"] in VIDEO_KINDS or m["media"] == "document" and mime.startswith("video/")) \
+        and is_video(m["media_path"])
+    return m["media_path"] if (picture or video) and Path(m["media_path"]).exists() else None
 
 
 # ================================================================ база индекса
@@ -179,10 +192,14 @@ class SearchDB:
             log.warning("размерность векторов %s → %s: векторный индекс пересоздаётся", old, dim)
             db.execute("drop table if exists vec_text")
             db.execute("drop table if exists vec_image")
+            db.execute("drop table if exists vec_frame")
             db.execute("update items set vec_sig = null, image_state = case when image is null then null else 'todo' end")
         for t in ("vec_text", "vec_image"):
             db.execute(f"create virtual table if not exists {t} using vec0(msg_id integer primary key, "
                        f"emb float[{dim}] distance_metric=cosine, sender integer, date integer)")
+        # кадры видео: frame_id = msg_id * MAX_FRAMES + номер кадра
+        db.execute(f"create virtual table if not exists vec_frame using vec0(frame_id integer primary key, "
+                   f"emb float[{dim}] distance_metric=cosine, msg_id integer, sender integer, date integer)")
         self.set_meta("dim", dim)
 
     @property
@@ -219,6 +236,7 @@ class SearchDB:
             "text_vecs": q("select count(*) from items where sig is not null and vec_sig = sig"),
             "text_todo": q("select count(*) from items where sig is not null and vec_sig is not sig"),
             "images": q("select count(*) from items where image_state = 'ok'"),
+            "frames": q("select count(*) from vec_frame"),
             "images_todo": q("select count(*) from items where image_state = 'todo'"),
             "images_error": q("select count(*) from items where image_state = 'error'"),
         }
@@ -306,6 +324,14 @@ class Embedder:
 
 # ================================================================ индексация
 
+MAX_FRAMES = 16          # кадров на видео в vec_frame (берём VIDEO_FRAMES)
+
+
+def _drop_frames(db, msg_id: int):
+    for j in range(MAX_FRAMES):         # vec0 удаляет только по первичному ключу
+        db.execute("delete from vec_frame where frame_id = ?", (msg_id * MAX_FRAMES + j,))
+
+
 class Indexer:
     def __init__(self, cfg: Config, cache: Cache, sdb: SearchDB | None = None):
         self.cfg, self.cache = cfg, cache
@@ -333,6 +359,16 @@ class Indexer:
 
     def _sync(self, chunk: int) -> dict:
         self.r = Renderer(self.cache, self.cfg)          # псевдонимы и чат могли смениться
+        if self.sdb.meta("videos") != "1":
+            # видео, кружки и GIF стали индексироваться кадрами — пересобрать их записи (штамп сброшен)
+            ids = [r[0] for r in self.cache.db.execute(
+                f"select id from messages where media in ({','.join('?' * len(VIDEO_KINDS))}) or "
+                "(media = 'document' and media_meta like '%\"video/%')", VIDEO_KINDS)]
+            with self.sdb.tx() as db:
+                for k in range(0, len(ids), 900):
+                    part = ids[k:k + 900]
+                    db.execute(f"update items set stamp = '' where msg_id in ({','.join('?' * len(part))})", part)
+            self.sdb.set_meta("videos", "1")
         stamps = self._stamps()
         have = {r[0]: r[1] for r in self.sdb.db.execute("select msg_id, stamp from items")}
         gone = [i for i in have if i not in stamps or stamps[i][1]]
@@ -360,6 +396,7 @@ class Indexer:
         db.execute("delete from fts where rowid = ?", (msg_id,))
         db.execute("delete from vec_text where msg_id = ?", (msg_id,))
         db.execute("delete from vec_image where msg_id = ?", (msg_id,))
+        _drop_frames(db, msg_id)
         db.execute("delete from items where msg_id = ?", (msg_id,))
 
     def _put(self, db, m, stamp: str, transcript, desc):
@@ -378,6 +415,7 @@ class Indexer:
         image = image_of(m)
         if image is None:
             db.execute("delete from vec_image where msg_id = ?", (m["id"],))
+            _drop_frames(db, m["id"])
             state = None
         elif old is not None and old["image"] == image and old["image_state"] in ("ok", "error"):
             state = old["image_state"]
@@ -417,7 +455,14 @@ class Indexer:
                     if it["image"] != sig:
                         continue
                     db.execute("delete from vec_image where msg_id = ?", (msg_id,))
-                    if vec is not None:
+                    _drop_frames(db, msg_id)
+                    if vec is not None and is_video(sig):
+                        size = self.sdb.dim * 4                 # воркер отдал кадры подряд
+                        for j in range(min(MAX_FRAMES, len(vec) // size)):
+                            db.execute("insert into vec_frame(frame_id, emb, msg_id, sender, date) "
+                                       "values (?, ?, ?, ?, ?)", (msg_id * MAX_FRAMES + j, vec[j * size:(j + 1) * size],
+                                                                  msg_id, it["sender"], it["date"]))
+                    elif vec is not None:
                         db.execute("insert into vec_image(msg_id, emb, sender, date) values (?, ?, ?, ?)",
                                    (msg_id, vec, it["sender"], it["date"]))
                     db.execute("update items set image_state = ? where msg_id = ?",
@@ -528,6 +573,9 @@ class Query:
     period_label: str = ""
     phrases: list[str] = field(default_factory=list)
     error: str = ""
+    # названные в запросе по имени (из «Как называют» в досье) — не фильтр, а подъём их сообщений
+    people: list[int] = field(default_factory=list)
+    name_words: set[str] = field(default_factory=set)
 
 
 def _period(s: str, now: datetime) -> tuple[datetime, datetime, str] | None:
@@ -651,8 +699,9 @@ class Searcher:
         self.cfg, self.cache, self.sdb = cfg, cache, sdb
         self.stem = stem or Stemmer()
 
-    def fts_query(self, q: Query) -> str | None:
-        """Основы слов через OR (bm25 поднимает совпавшие по нескольким словам), фразы — в кавычках."""
+    def fts_query(self, q: Query, skip: set[str] = frozenset()) -> str | None:
+        """Основы слов через OR (bm25 поднимает совпавшие по нескольким словам), фразы — в кавычках;
+        skip — слова, которые не искать (имя автора: в тексте его сообщений его нет)."""
         parts = []
         for ph in q.phrases:
             stems = [self.stem.stem(w) for w in self.stem.words(ph)]
@@ -662,7 +711,7 @@ class Searcher:
         for ph in q.phrases:
             rest = rest.replace(ph, " ")
         for w in self.stem.words(rest):
-            if w in STOP or len(w) < 2:
+            if w in STOP or len(w) < 2 or w in skip:
                 continue
             s = self.stem.stem(w)
             if s in PICTURE_STEMS and self.wants_picture(q):
@@ -688,16 +737,33 @@ class Searcher:
             args.append(q.until)
         return sql, args
 
+    def _images(self, q: Query, qvec: bytes, k: int, sender: int | None = None) -> list[int]:
+        """Фото и видео по сходству с запросом: у видео — лучший из кадров."""
+        db = self.sdb.db
+        flt, args = self._filters(q, "date", "sender")
+        if sender is not None:
+            flt, args = flt + " and sender = ?", [*args, sender]
+        sims = [(1 - d, mid) for mid, d in db.execute(
+            f"select msg_id, distance from vec_image where emb match ? and k = ?{flt} order by distance",
+            (qvec, k, *args)).fetchall() if 1 - d >= MIN_SIM["image"]]
+        best: dict[int, float] = {}
+        for mid, d in db.execute(f"select msg_id, distance from vec_frame where emb match ? and k = ?{flt} "
+                                 f"order by distance", (qvec, k * 4, *args)).fetchall():
+            if 1 - d >= MIN_SIM["frame"] and mid not in best:
+                best[mid] = 1 - d
+        sims += [(v, mid) for mid, v in best.items()]
+        return [mid for _, mid in sorted(sims, reverse=True)[:k]]
+
     def search(self, q: Query, qvec: bytes | None, k: int = 100, limit: int = 40) -> list[Hit]:
         """Гибрид: KNN по векторам текстов и картинок + FTS5, слияние RRF."""
         db = self.sdb.db
         lists: dict[str, list[int]] = {}
         if qvec is not None:
-            for kind, table in (("text", "vec_text"), ("image", "vec_image")):
-                flt, args = self._filters(q, "date", "sender")
-                lists[kind] = [r[0] for r in db.execute(
-                    f"select msg_id, distance from {table} where emb match ? and k = ?{flt} order by distance",
-                    (qvec, k, *args)).fetchall() if 1 - r[1] >= MIN_SIM[kind]]
+            flt, args = self._filters(q, "date", "sender")
+            lists["text"] = [r[0] for r in db.execute(
+                f"select msg_id, distance from vec_text where emb match ? and k = ?{flt} order by distance",
+                (qvec, k, *args)).fetchall() if 1 - r[1] >= MIN_SIM["text"]]
+            lists["image"] = self._images(q, qvec, k)
         fq = self.fts_query(q)
         if fq:
             flt, args = self._filters(q, "i.date", "i.sender")
@@ -712,13 +778,32 @@ class Searcher:
             flt, args = self._filters(q, "date", "sender")
             lists["fts"] = [r[0] for r in db.execute(
                 f"select msg_id from items where body <> ''{flt} order by date desc limit ?", (*args, k)).fetchall()]
-        weights = dict(WEIGHTS, image=1.5) if self.wants_picture(q) else WEIGHTS
+        # человек назван по имени — те же поиски среди его сообщений (имя в тексте не ищем)
+        if q.sender is None:
+            fq_p = self.fts_query(q, skip={w.lower() for w in q.name_words})
+            for uid in q.people[:2]:
+                if qvec is not None:
+                    flt, args = self._filters(q, "date", "sender")
+                    lists[f"text_p:{uid}"] = [r[0] for r in db.execute(
+                        f"select msg_id, distance from vec_text where emb match ? and k = ?{flt} and sender = ? "
+                        f"order by distance", (qvec, k, *args, uid)).fetchall() if 1 - r[1] >= MIN_SIM["text"]]
+                    lists[f"image_p:{uid}"] = self._images(q, qvec, k, sender=uid)
+                if fq_p:
+                    flt, args = self._filters(q, "i.date", "i.sender")
+                    try:
+                        lists[f"fts_p:{uid}"] = [r[0] for r in db.execute(
+                            f"select f.rowid from fts f join items i on i.msg_id = f.rowid where fts match ? "
+                            f"and i.sender = ?{flt} order by bm25(fts) limit ?", (fq_p, uid, *args, k)).fetchall()]
+                    except sqlite3.OperationalError as exc:
+                        log.warning("FTS «%s»: %s", fq_p, exc)
+        weights = dict(WEIGHTS, image=1.5, image_p=2.0) if self.wants_picture(q) else WEIGHTS
         scores: dict[int, Hit] = {}
-        for kind, ids in lists.items():
+        for name, ids in lists.items():
+            kind = name.split(":")[0]
             for rank, mid in enumerate(ids):
                 h = scores.setdefault(mid, Hit(mid, 0.0, set()))
                 h.score += weights[kind] / (RRF_K + rank + 1)
-                h.via.add(kind)
+                h.via.add(kind.removesuffix("_p"))
         hits = sorted(scores.values(), key=lambda h: -h.score)
         # альбом — одной строкой; удалённые (если индекс ещё не догнал) — мимо
         out, albums = [], set()
@@ -779,6 +864,8 @@ def format_page(hits: list[Hit], page: int, per_page: int, q: Query, r: Renderer
         head += f" · от {esc(r.short(q.sender))}"
     if q.period_label:
         head += f" · {esc(q.period_label)}"
+    if q.people:
+        head += " · 👤 " + ", ".join(esc(r.short(uid)) for uid in q.people)
     if not hits:
         return head + "\n\nНичего не нашёл." + ("" if semantic else "\n<i>Смысловой индекс ещё не готов — искал "
                                                                      "только по словам.</i>")
@@ -797,7 +884,7 @@ def format_page(hits: list[Hit], page: int, per_page: int, q: Query, r: Renderer
         lines.append(f"<b>{n}.</b> <a href=\"{link}\">{esc(who)} · {dt:%d.%m.%y %H:%M}</a>" + (f" {icon}" if icon else ""))
         frag = snippet(it["body"] if it else (m["text"] or ""), stems, stem)
         if not frag and "image" in h.via:
-            frag = "<i>похожая картинка</i>"
+            frag = "<i>похожий кадр</i>" if (m["media"] or "") in VIDEO_KINDS else "<i>похожая картинка</i>"
         if frag:
             lines.append(frag)
         lines.append("")
@@ -857,10 +944,14 @@ class SearchService:
                 await emb.close()
                 log.info("эмбеддер (%s, %s) остановлен по простою", emb.device, emb.modality)
 
-    async def find(self, raw: str, now: datetime) -> tuple[Query, list[Hit], bool]:
+    async def find(self, raw: str, now: datetime, names=None) -> tuple[Query, list[Hit], bool]:
+        """names(text) -> Counter{uid: n} — кто назван в тексте по имени из досье (Analyzer._name_hits)."""
         q = parse_query(raw, self.cache, now)
         if q.error:
             return q, [], False
+        if names is not None and q.sender is None:
+            q.people = [uid for uid, _ in names(q.text).most_common(2)]
+            q.name_words = {w for w in re.findall(r"[^\W\d_]+", q.text) if names(w)}
         qvec = await self.query_vec(q.text)
         hits = await asyncio.to_thread(self.searcher.search, q, qvec)
         return q, hits, qvec is not None

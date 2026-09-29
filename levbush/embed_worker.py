@@ -5,7 +5,8 @@
 
 stdin — строка JSON на пачку: {"items": [{"text": "…", "role": "query"|"document"} | {"image": "путь"}, …]};
 stdout — первой строкой {"ready": true, …}, дальше на каждую пачку {"vecs": [base64 float32 | null, …],
-"errors": {индекс: "текст"}}. Вектора L2-нормированы, обрезаны до --dim (Matryoshka).
+"errors": {индекс: "текст"}}. Вектора L2-нормированы, обрезаны до --dim (Matryoshka). Видео (путь .mp4 и т.п.
+в "image") — --frames кадров равномерно по ролику, каждый как картинка; векторы кадров идут подряд одной строкой.
 
 Текст и картинки — в одном пространстве («locked aligned towers»: текстовая башня = jina-embeddings-v5-text-small),
 поэтому текстовый запрос ищет и по сообщениям, и по фото. Текст — как в custom_st.py модели: «Query: …» /
@@ -15,8 +16,11 @@ import argparse
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
+
+VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 
 
 def main():
@@ -29,6 +33,7 @@ def main():
     p.add_argument("--max-tokens", type=int, default=1024)        # длиннее — обрезается (сообщения короткие)
     p.add_argument("--max-pixels", type=int, default=1310720)     # как у модели: 256–1280 токенов на картинку
     p.add_argument("--batch-tokens", type=int, default=16384)     # токенов (с паддингом) в одном прогоне текста
+    p.add_argument("--frames", type=int, default=6)                # кадров на видео
     a = p.parse_args()
 
     # протокол — в исходный stdout; всё, что печатают библиотеки (прогресс загрузки, предупреждения), — в stderr
@@ -86,10 +91,32 @@ def main():
                 out[batch[i][0]] = enc(v)
             k += n
 
+    def frames(path: str, side: int = 512) -> list:
+        """Кадры равномерно по ролику (одним вызовом ffmpeg), вписанные в квадрат side×side."""
+        info = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
+                              capture_output=True, text=True, timeout=60).stdout
+        dur = float((json.loads(info or "{}").get("format") or {}).get("duration") or 1)
+        vf = (f"fps={a.frames / max(dur, 0.1):.4f},scale={side}:{side}:force_original_aspect_ratio=decrease,"
+              f"pad={side}:{side}:(ow-iw)/2:(oh-ih)/2")
+        raw = subprocess.run(["ffmpeg", "-v", "quiet", "-i", path, "-an", "-vf", vf, "-frames:v", str(a.frames),
+                              "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, timeout=300).stdout
+        n = len(raw) // (side * side * 3)
+        if not n:
+            raise ValueError("ffmpeg не отдал ни одного кадра")
+        return [Image.frombuffer("RGB", (side, side), raw[i * side * side * 3:(i + 1) * side * side * 3])
+                for i in range(n)]
+
     @torch.inference_mode()
     def image(path: str):
+        if path.lower().endswith(VIDEO_EXT):
+            vecs = [picture(f) for f in frames(path)]
+            return base64.b64encode(b"".join(base64.b64decode(v) for v in vecs)).decode()
         img = Image.open(path)
         img.load()
+        return picture(img)
+
+    @torch.inference_mode()
+    def picture(img):
         if img.mode != "RGB":
             img = img.convert("RGB")
         prompt = proc.apply_chat_template(

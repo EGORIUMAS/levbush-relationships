@@ -56,6 +56,9 @@ class FakeEmbedder:
                 if "битая" in it["image"]:
                     out.append(None)
                     errors[i] = "не картинка"
+                elif SR.is_video(it["image"]):          # кадры подряд: «имя файла» — во втором из трёх
+                    name = it["image"].rsplit("/", 1)[-1].split(".")[0]
+                    out.append(self.vec("кружок") + self.vec(name) + self.vec("кружок"))
                 else:
                     out.append(self.vec(it["image"].rsplit("/", 1)[-1].split(".")[0]))
             else:
@@ -340,3 +343,33 @@ def test_text_batch_failure_is_retried(env):
     with pytest.raises(SR.EmbedError):
         asyncio.run(svc.indexer.embed(Broken()))
     assert svc.indexer.pending() == (6, 3)
+
+
+def test_video_frames_and_named_person(env):
+    """Видео индексируется кадрами (сходство — по лучшему кадру); имя человека в запросе поднимает его сообщения."""
+    cfg, cache = env
+    (cfg.media_dir / "арбуз.mp4").write_bytes(b"")
+    with cache.tx() as db:
+        cache.upsert_message(dict(id=11, date=T0 + 42 * DAY, sender_id=B, media="video_note", media_state="ok",
+                                  media_path=str(cfg.media_dir / "арбуз.mp4")), db)
+        cache.upsert_message(dict(id=12, date=T0 + 42 * DAY, sender_id=A, text="Кто-нибудь хочет арбуз к чаю?"), db)
+    svc = service(cfg, cache)
+    svc.indexer.sync()
+    embed(svc)
+    assert svc.sdb.db.execute("select count(*) from vec_frame where msg_id = 11").fetchone()[0] == 3
+    assert svc.sdb.db.execute("select count(*) from vec_image where msg_id = 11").fetchone()[0] == 0
+    assert 11 in find(svc, "арбуз")
+    # «Боря ест арбуз»: Боря назван по имени — его кружок выше сообщения Ани про арбуз
+    from collections import Counter
+    names = lambda text: Counter({B: 1} if "бор" in text.lower() else {})  # noqa: E731
+
+    async def qvec(text):
+        return FakeEmbedder().vec(text)
+    svc.query_vec = qvec
+    q, hits, _ = asyncio.run(svc.find("Боря ест арбуз", datetime.fromtimestamp(NOW, cfg.tz), names=names))
+    ids = [h.msg_id for h in hits]
+    assert q.people == [B] and q.name_words == {"Боря"} and ids.index(11) < ids.index(12)
+    # удалили — кадры уходят вместе с сообщением
+    cache.db.execute("update messages set deleted = 1 where id = 11")
+    svc.indexer.sync()
+    assert svc.sdb.db.execute("select count(*) from vec_frame where msg_id = 11").fetchone()[0] == 0
