@@ -1,0 +1,601 @@
+--- a/vllm/v1/attention/backends/turboquant_attn.py
++++ b/vllm/v1/attention/backends/turboquant_attn.py
+@@ -70,6 +70,12 @@
+ # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
+ _CONTINUATION_DECODE_THRESHOLD = 128
+ 
++# [levbush patch] групповое декод-ядро (кэш читается один раз на группу голов и токены
++# проверки MTP); VLLM_TQ_GROUPED=0 — старое ядро по голове
++import os as _os
++
++_TQ_GROUPED = _os.environ.get("VLLM_TQ_GROUPED", "1") != "0"
++
+ 
+ def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
+     """Orthonormal Hadamard matrix (Sylvester construction), cached per (d, device).
+@@ -190,6 +196,8 @@
+     is_prefill: bool = False
+     num_decodes: int = 0  # number of decode requests (first in batch)
+     num_decode_tokens: int = 0  # tokens from decode requests
++    # [levbush patch] токенов у каждого декодного запроса, если у всех поровну (1 + k при MTP), иначе 0
++    decode_q_len: int = 0
+     # CPU-resident copies used by the prefill path for per-request iteration
+     # without per-step D2H syncs.
+     query_start_loc_cpu: torch.Tensor | None = None
+@@ -204,7 +212,11 @@
+ 
+     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
++        # [levbush patch] Спекулятивные токены (1+k на запрос) идут как декодирование: каждый токен
++        # разворачивается в отдельный «запрос» декод-ядра с длиной, посчитанной на GPU (см. forward).
++        # Раньше они шли в ветку continuation-prefill с Python-циклом по CPU-метаданным, а та
++        # захватывалась в FULL CUDA graph с длинами от захвата — вывод портился (vllm#53180).
++        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+         self._reserve_workspace()
+ 
+     def _reserve_workspace(self) -> None:
+@@ -215,7 +227,8 @@
+         model_config = self.vllm_config.model_config
+         parallel_config = self.vllm_config.parallel_config
+ 
+-        max_num_reqs = scheduler_config.max_num_seqs
++        # [levbush patch] при спекулятивном декодировании строк декод-ядра — по токену проверки
++        max_num_reqs = scheduler_config.max_num_seqs * (self.reorder_batch_threshold or 1)
+         num_heads = model_config.get_num_attention_heads(parallel_config)
+         num_kv_heads = self.kv_cache_spec.num_kv_heads
+         head_size = self.kv_cache_spec.head_size
+@@ -236,12 +249,13 @@
+         if not reserve_continuation_prefill:
+             return
+ 
+-        max_cached_len = max(0, model_config.max_model_len - 1)
+-        alloc_len = round_up(max_cached_len, self.kv_cache_spec.block_size)
++        # [levbush patch] буфер на всю длину (кэш + новый кусок) в dtype модели: K/V
++        # собираются прямо в нём и идут во flash_attn без копий k_full/v_full
++        alloc_len = round_up(model_config.max_model_len, self.kv_cache_spec.block_size)
+         cache_buf_shape = (1, num_kv_heads, alloc_len, head_size)
+         current_workspace_manager().get_simultaneous(
+-            (cache_buf_shape, torch.float16),
+-            (cache_buf_shape, torch.float16),
++            (cache_buf_shape, model_config.dtype),
++            (cache_buf_shape, model_config.dtype),
+         )
+ 
+     def build_for_cudagraph_capture(
+@@ -265,6 +279,12 @@
+             cam, decode_threshold=self.reorder_batch_threshold
+         )
+ 
++        decode_q_len = 0
++        if num_decodes and cam.query_start_loc_cpu is not None:
++            lens = cam.query_start_loc_cpu[1 : num_decodes + 1] - cam.query_start_loc_cpu[:num_decodes]
++            if bool((lens == lens[0]).all()):
++                decode_q_len = int(lens[0])
++
+         return TurboQuantMetadata(
+             seq_lens=cam.seq_lens,
+             slot_mapping=cam.slot_mapping,
+@@ -276,6 +296,7 @@
+             is_prefill=(cam.max_query_len > 1),
+             num_decodes=num_decodes,
+             num_decode_tokens=num_decode_tokens,
++            decode_q_len=decode_q_len,
+             query_start_loc_cpu=cam.query_start_loc_cpu,
+             seq_lens_cpu=cam.seq_lens_cpu_upper_bound,
+         )
+@@ -482,7 +503,8 @@
+         if not attn_metadata.is_prefill:
+             # Pure decode batch — fast path
+             attn_out = self._decode_attention(
+-                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
++                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer,
++                tokens_per_req=1 if _TQ_GROUPED else 0,
+             )
+         elif num_decodes == 0:
+             # Pure prefill batch
+@@ -506,20 +528,41 @@
+             )
+ 
+             # --- Decode portion (first num_decodes requests) ---
+-            # Use full-batch max_seq_len as safe upper bound (no GPU sync).
++            # [levbush patch] У декодных запросов может быть до 1+k токенов (MTP).
++            # Каждый токен — отдельная строка декод-ядра: запрос r, позиция p из L_r
++            # видит seq_len_r - L_r + 1 + p токенов кэша (K/V уже записаны
++            # do_kv_cache_update). Всё на GPU и фиксированной формы — годится для
++            # FULL CUDA graph; при L_r = 1 совпадает с обычным декодом.
++            T = num_decode_tokens
++            qsl = attn_metadata.query_start_loc[: num_decodes + 1]
++            tok = torch.arange(T, device=device, dtype=qsl.dtype)
++            req = torch.searchsorted(qsl[1:].contiguous(), tok, right=True)
++            req = req.clamp_(max=num_decodes - 1).long()
++            start = qsl[req]
++            q_len = qsl[req + 1] - start
++            synth_seq_lens = (
++                attn_metadata.seq_lens[req] - q_len + 1 + (tok - start)
++            ).clamp_(min=1).to(attn_metadata.seq_lens.dtype)
+             decode_meta = TurboQuantMetadata(
+-                seq_lens=attn_metadata.seq_lens[:num_decodes],
++                seq_lens=synth_seq_lens,
+                 slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
+-                block_table=attn_metadata.block_table[:num_decodes],
+-                query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
++                block_table=attn_metadata.block_table[req],
++                query_start_loc=None,
+                 num_actual_tokens=num_decode_tokens,
+                 max_query_len=1,
+                 max_seq_len=attn_metadata.max_seq_len,
+                 is_prefill=False,
+             )
+             attn_out[:num_decode_tokens] = self._decode_attention(
+-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
++                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer,
++                tokens_per_req=attn_metadata.decode_q_len if _TQ_GROUPED else 0,
+             )
++            if num_decode_tokens == N:          # только декод (в т.ч. проверка MTP)
++                if output.ndim == 3:
++                    output[:N] = attn_out.to(output.dtype)
++                else:
++                    output[:N] = attn_out.reshape(N, -1).to(output.dtype)
++                return output
+ 
+             # --- Prefill portion (remaining requests) ---
+             # CRITICAL: use prefill-specific max_seq_len so flash_attn's
+@@ -783,36 +826,37 @@
+         mse_bytes = self._mse_bytes
+         val_data_bytes = self._val_data_bytes
+ 
+-        # Dequant cached K/V from TQ cache
+-        # Allocate slightly over to align to block_size for the grid.
+-        # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
+-        alloc_len = math.ceil(cached_len / block_size) * block_size
++        # [levbush patch] Память: раньше кэш распаковывался в fp16-буфер, потом
++        # копировался в новые k_full/v_full (bf16) плюс копия повёрнутых ключей —
++        # ~2 ГиБ временной памяти на 200k токенов сверх рабочего буфера, которых нет
++        # в оценке памяти при старте (OOM на длинном промпте). Теперь всё собирается
++        # в самом рабочем буфере (dtype модели, длина seq_len), без копий.
++        qdtype = query.dtype
++        alloc_len = math.ceil(seq_len / block_size) * block_size
+         buf_shape = (1, Hk, alloc_len, D)
+-        # Use WorkspaceManager for dequant buffers.
+-        # Shared across all layers — saves 60× memory at long context.
+-        # Required for CUDA Graph capture (per-layer growth incompatible with CG).
+         k_buf, v_buf = current_workspace_manager().get_simultaneous(
+-            (buf_shape, torch.float16),
+-            (buf_shape, torch.float16),
++            (buf_shape, qdtype),
++            (buf_shape, qdtype),
+         )
+-        # Skip .zero_() — kernel writes all positions up to cached_len,
+-        # and we only read [:cached_len] afterwards.
+-        k_cached = k_buf[:, :, :alloc_len, :]
+-        v_cached = v_buf[:, :, :alloc_len, :]
+ 
+-        grid = (alloc_len, 1 * Hk)
++        # Распаковать кэш [0, cached_len) (ядро пишет блоками — до cached_alloc;
++        # хвост блока перекроет новый кусок ниже). tl.store приводит к dtype буфера.
++        cached_alloc = math.ceil(cached_len / block_size) * block_size
++        grid = (cached_alloc, 1 * Hk)
++        # MSE-ключи до поворота — в fp16 (те же байты буфера), как в исходной версии
++        k_dst = k_buf if self.tq_config.key_fp8 else k_buf.view(torch.float16)
+         _tq_full_dequant_kv[grid](
+             kv_cache,
+             block_table,
+             centroids,
+-            k_cached,
+-            v_cached,
+-            k_cached.stride(0),
+-            k_cached.stride(1),
+-            k_cached.stride(2),
+-            v_cached.stride(0),
+-            v_cached.stride(1),
+-            v_cached.stride(2),
++            k_dst,
++            v_buf,
++            k_dst.stride(0),
++            k_dst.stride(1),
++            k_dst.stride(2),
++            v_buf.stride(0),
++            v_buf.stride(1),
++            v_buf.stride(2),
+             kv_cache.stride(0),
+             kv_cache.stride(1),
+             kv_cache.stride(2),
+@@ -832,32 +876,21 @@
+             num_warps=4,
+         )
+ 
+-        # Inverse-rotate MSE keys back to original space
++        # MSE-ключи — обратный поворот (fp32) на месте, кусками: fp16 -> dtype модели
+         if not self.tq_config.key_fp8:
+-            # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
+-            Pi_half = layer._tq_Pi_half
+-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
+-            k_flat = k_flat @ Pi_half
+-            k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
+-                0, 1
+-            )  # (cached_len, Hk, D) — already fp16
+-        else:
+-            k_cached_trim = k_cached[0, :, :cached_len, :].transpose(
+-                0, 1
+-            )  # (cached_len, Hk, D)
+-
+-        # Skip .contiguous() — the copy into k_full/v_full handles layout
+-        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
+-
+-        # Concatenate cached + current chunk K/V (match query dtype)
+-        # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
+-        qdtype = query.dtype
+-        k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+-        v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+-        k_full[:cached_len] = k_cached_trim.to(qdtype)
+-        k_full[cached_len:] = key_chunk
+-        v_full[:cached_len] = v_cached_trim.to(qdtype)
+-        v_full[cached_len:] = val_chunk
++            Pi = layer._tq_Pi
++            step = 16384
++            for h in range(Hk):
++                for a in range(0, cached_len, step):
++                    b = min(a + step, cached_len)
++                    rot = k_dst[0, h, a:b].float() @ Pi
++                    k_buf[0, h, a:b] = rot
++
++        # Новый кусок — следом за кэшем
++        k_buf[0, :, cached_len:seq_len] = key_chunk.transpose(0, 1)
++        v_buf[0, :, cached_len:seq_len] = val_chunk.transpose(0, 1)
++        k_full = k_buf[0, :, :seq_len].transpose(0, 1)  # (seq_len, Hk, D), без копии
++        v_full = v_buf[0, :, :seq_len].transpose(0, 1)
+ 
+         # Attention: q_len queries attending to seq_len K/V with causal mask
+         if _HAS_FLASH_ATTN:
+@@ -911,6 +944,7 @@
+         centroids: torch.Tensor,
+         PiT: torch.Tensor | None = None,
+         layer: torch.nn.Module | None = None,
++        tokens_per_req: int = 0,
+     ) -> torch.Tensor:
+         # Acquire shared decode scratch buffers from WorkspaceManager.
+         # Layers execute sequentially so one set of buffers is sufficient.
+@@ -949,5 +983,6 @@
+             lse_buf=lse_buf,
+             buf_holder=layer,
+             max_num_kv_splits=self.max_num_kv_splits,
++            tokens_per_req=tokens_per_req,
+         )
+         return result
+--- a/vllm/v1/attention/ops/triton_turboquant_decode.py
++++ b/vllm/v1/attention/ops/triton_turboquant_decode.py
+@@ -314,6 +314,178 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
++# [levbush patch] Grouped stage1: одна программа на (запрос, kv-голова, кусок KV).
++# Блок кэша читается и распаковывается один раз на все Hq/Hk голов группы и все
++# L токенов запроса (1 + k токенов проверки MTP); скоры и взвешивание значений —
++# через tl.dot. У каждой строки (токен t, голова g) своя каузальная длина
++# Seq_lens[tok] — токен t видит seq_len_req - (L - 1) + t токенов. Куски KV
++# считаются по длине последнего токена запроса (самой большой) — так же их
++# потом разбирает stage2 (ему передаются эти длины).
++# ---------------------------------------------------------------------------
++@triton.jit
++def _tq_decode_stage1_grouped(
++    Q_rot_ptr,  # [B_tok, Hq, D]
++    KV_cache_ptr,
++    Block_table_ptr,  # [B_tok, max_num_blocks] (строки токенов одного запроса одинаковы)
++    Seq_lens_ptr,  # [B_tok] int32 — каузальная длина каждого токена
++    Centroids_ptr,
++    Mid_o_ptr,  # [B_tok, Hq, NUM_KV_SPLITS, D+1]
++    stride_qb,
++    stride_qh,
++    stride_cache_block,
++    stride_cache_pos,
++    stride_cache_head,
++    stride_bt_b,
++    stride_mid_b,
++    stride_mid_h,
++    stride_mid_s,
++    HEAD_DIM: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    NUM_KV_SPLITS: tl.constexpr,
++    KV_GROUP_SIZE: tl.constexpr,
++    TOKENS_PER_REQ: tl.constexpr,
++    BLOCK_H: tl.constexpr,  # next_pow2(TOKENS_PER_REQ * KV_GROUP_SIZE), >= 16
++    MSE_BITS: tl.constexpr,
++    MSE_BYTES: tl.constexpr,
++    KPS: tl.constexpr,
++    VQB: tl.constexpr,
++    VAL_DATA_BYTES: tl.constexpr,
++    ATTN_SCALE: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_KV: tl.constexpr,
++    KEY_FP8: tl.constexpr,
++    NORM_CORRECTION: tl.constexpr = 0,
++    FP8_E4B15: tl.constexpr = 0,
++):
++    rid = tl.program_id(0)  # запрос
++    kv_head = tl.program_id(1)
++    sid = tl.program_id(2)
++
++    rows = tl.arange(0, BLOCK_H)
++    row_ok = rows < TOKENS_PER_REQ * KV_GROUP_SIZE
++    t = rows // KV_GROUP_SIZE
++    g = rows % KV_GROUP_SIZE
++    tok = rid * TOKENS_PER_REQ + tl.where(row_ok, t, 0)
++    head = kv_head * KV_GROUP_SIZE + g
++
++    row_len = tl.load(Seq_lens_ptr + tok, mask=row_ok, other=0)
++    part_len = tl.load(Seq_lens_ptr + rid * TOKENS_PER_REQ + TOKENS_PER_REQ - 1)
++    split_len = tl.cdiv(part_len, NUM_KV_SPLITS)
++    split_start = split_len * sid
++    split_end = tl.minimum(split_start + split_len, part_len)
++    if split_start >= split_end:
++        return
++
++    d_offs = tl.arange(0, BLOCK_D)
++    d_mask = d_offs < HEAD_DIM
++    kv_range = tl.arange(0, BLOCK_KV)
++
++    q = tl.load(
++        Q_rot_ptr + tok[:, None] * stride_qb + head[:, None] * stride_qh + d_offs[None, :],
++        mask=row_ok[:, None] & d_mask[None, :],
++        other=0.0,
++    )
++    if KEY_FP8:
++        q = q.to(tl.bfloat16)  # запрос уже bf16/fp16, ключ fp8 -> bf16 без потерь
++    else:
++        q = q.to(tl.float32)  # повёрнутый запрос (fp32) — скоры в tf32
++
++    if not KEY_FP8:
++        mse_bit_off = d_offs * MSE_BITS
++        mse_byte_idx = mse_bit_off // 8
++        mse_bit_shift = mse_bit_off % 8
++        mse_mask = (1 << MSE_BITS) - 1
++    if VQB == 3:
++        val_bit_off = d_offs * 3
++        val_byte_idx = val_bit_off // 8
++        val_bit_shift = val_bit_off % 8
++
++    m_prev = tl.full([BLOCK_H], -float("inf"), dtype=tl.float32)
++    l_prev = tl.zeros([BLOCK_H], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
++
++    bt_base = (rid * TOKENS_PER_REQ).to(tl.int64) * stride_bt_b
++
++    for start_n in range(split_start, split_end, BLOCK_KV):
++        kv_offs = start_n + kv_range
++        kv_mask = kv_offs < split_end
++        page_idx = kv_offs // BLOCK_SIZE
++        page_off = kv_offs % BLOCK_SIZE
++        block_nums = tl.load(Block_table_ptr + bt_base + page_idx, mask=kv_mask, other=0).to(tl.int64)
++        slot_bases = (
++            block_nums * stride_cache_block
++            + page_off.to(tl.int64) * stride_cache_pos
++            + tl.cast(kv_head, tl.int64) * stride_cache_head
++        )
++        tile_mask = kv_mask[:, None] & d_mask[None, :]
++
++        # --- ключи: [BLOCK_KV, BLOCK_D] -> скоры [BLOCK_H, BLOCK_KV]
++        if KEY_FP8:
++            k_raw = tl.load(KV_cache_ptr + slot_bases[:, None] + d_offs[None, :], mask=tile_mask, other=0)
++            if FP8_E4B15:
++                k_float = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
++            else:
++                k_float = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++            k_bf = tl.where(tile_mask, k_float, 0.0).to(tl.bfloat16)
++            scores = tl.dot(q, tl.trans(k_bf)) * ATTN_SCALE
++        else:
++            mse_addrs0 = slot_bases[:, None] + mse_byte_idx[None, :]
++            mse_raw0 = tl.load(KV_cache_ptr + mse_addrs0, mask=tile_mask, other=0).to(tl.int32)
++            mse_raw1 = tl.load(KV_cache_ptr + mse_addrs0 + 1, mask=tile_mask, other=0).to(tl.int32)
++            mse_idx = ((mse_raw0 | (mse_raw1 << 8)) >> mse_bit_shift[None, :]) & mse_mask
++            c_vals = tl.load(Centroids_ptr + mse_idx, mask=tile_mask, other=0.0)
++            if NORM_CORRECTION:
++                c_norm_sq = tl.sum(tl.where(d_mask[None, :], c_vals * c_vals, 0.0), axis=1)
++                c_vals = c_vals * (1.0 / tl.sqrt(c_norm_sq + 1e-16))[:, None]
++            c_vals = tl.where(tile_mask, c_vals, 0.0)
++            norm_bases = slot_bases + MSE_BYTES
++            n_lo = tl.load(KV_cache_ptr + norm_bases, mask=kv_mask, other=0).to(tl.uint16)
++            n_hi = tl.load(KV_cache_ptr + norm_bases + 1, mask=kv_mask, other=0).to(tl.uint16)
++            vec_norms = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
++            scores = tl.dot(q, tl.trans(c_vals), input_precision="tf32") * (vec_norms * ATTN_SCALE)[None, :]
++
++        valid = row_ok[:, None] & kv_mask[None, :] & (kv_offs[None, :] < row_len[:, None])
++        scores = tl.where(valid, scores, -float("inf"))
++
++        # --- онлайн-softmax по строкам (строка без валидных токенов не даёт NaN)
++        n_e_max = tl.maximum(tl.max(scores, 1), m_prev)
++        safe_max = tl.where(n_e_max == -float("inf"), 0.0, n_e_max)
++        re_scale = tl.exp(m_prev - safe_max)
++        p = tl.exp(scores - safe_max[:, None])
++
++        # --- значения: [BLOCK_KV, BLOCK_D]
++        val_bases = slot_bases + KPS
++        if VQB == 3:
++            val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
++            val_raw0 = tl.load(KV_cache_ptr + val_addrs0, mask=tile_mask, other=0).to(tl.int32)
++            val_raw1 = tl.load(KV_cache_ptr + val_addrs0 + 1, mask=tile_mask, other=0).to(tl.int32)
++            v_idx = (((val_raw0 | (val_raw1 << 8)) >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
++        else:  # VQB == 4
++            val_raw = tl.load(KV_cache_ptr + val_bases[:, None] + (d_offs // 2)[None, :], mask=tile_mask,
++                              other=0).to(tl.int32)
++            v_idx = ((val_raw >> ((d_offs % 2) * 4)[None, :]) & 0xF).to(tl.float32)
++        sc_bases = val_bases + VAL_DATA_BYTES
++        sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(tl.uint16)
++        sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(tl.uint16)
++        v_scales = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
++        zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(tl.uint16)
++        zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(tl.uint16)
++        v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
++        values = tl.where(tile_mask, v_idx * v_scales[:, None] + v_zeros[:, None], 0.0)
++
++        acc = acc * re_scale[:, None] + tl.dot(p.to(tl.bfloat16), values.to(tl.bfloat16))
++        l_prev = l_prev * re_scale + tl.sum(p, 1)
++        m_prev = n_e_max
++
++    out_base = tok * stride_mid_b + head * stride_mid_h + sid * stride_mid_s
++    safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
++    tl.store(Mid_o_ptr + out_base[:, None] + d_offs[None, :], acc / safe_l[:, None],
++             mask=row_ok[:, None] & d_mask[None, :])
++    lse = tl.where(l_prev > 0.0, m_prev + tl.log(safe_l), -float("inf"))
++    tl.store(Mid_o_ptr + out_base + HEAD_DIM, lse, mask=row_ok)
++
++
++# ---------------------------------------------------------------------------
+ # Pre-dequant kernel: Bulk dequant K (MSE+norms) and V to fp16
+ # ---------------------------------------------------------------------------
+ 
+@@ -465,6 +637,11 @@
+ 
+ _layout_cache: dict = {}
+ 
++# [levbush patch] тайлы группового ядра — подобраны на RTX 5090 (Qwen 3.8 27B: 24/4 головы, D=256):
++# 1 токен на запрос — BLOCK_KV 16, 1+k токенов (MTP) — 32; 4 warps; стадии конвейера не влияют.
++# Кусков KV лучше 64 (--attention-config.tq_max_kv_splits_for_cuda_graph=64): при 32 и одном
++# запросе программ меньше, чем SM. 70k токенов, слой: MTP 1349 → 168 мкс, обычный декод 722 → 188 мкс.
++
+ 
+ def _get_layout(D, mse_bits, value_quant_bits, key_packed_size):
+     """Get cached layout constants."""
+@@ -503,6 +680,7 @@
+     lse_buf: torch.Tensor | None = None,
+     buf_holder: Any = None,
+     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
++    tokens_per_req: int = 0,  # [levbush patch] >0 — групповое ядро: B = запросы * tokens_per_req
+ ) -> torch.Tensor:
+     """Launch fused TQ decode attention (Triton stage1 + stage2).
+ 
+@@ -549,43 +727,88 @@
+ 
+     # Stage 1: split-KV tiled attention scoring + value accumulation
+     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
+-    BLOCK_KV = 4
+-    grid = (B, Hq, NUM_KV_SPLITS)
+-    _tq_decode_stage1[grid](
+-        q_rot,
+-        kv_cache,
+-        block_table,
+-        seq_lens,
+-        centroids,
+-        mid_o,
+-        q_rot.stride(0),
+-        q_rot.stride(1),
+-        kv_cache.stride(0),
+-        kv_cache.stride(1),
+-        kv_cache.stride(2),
+-        block_table.stride(0),
+-        mid_o.stride(0),
+-        mid_o.stride(1),
+-        mid_o.stride(2),
+-        NUM_KV_HEADS=Hk,
+-        HEAD_DIM=D,
+-        BLOCK_SIZE=block_size,
+-        NUM_KV_SPLITS=NUM_KV_SPLITS,
+-        KV_GROUP_SIZE=kv_group_size,
+-        MSE_BITS=mse_bits,
+-        MSE_BYTES=cfg["mse_bytes"],
+-        KPS=key_packed_size,
+-        VQB=value_quant_bits,
+-        VAL_DATA_BYTES=cfg["val_data_bytes"],
+-        ATTN_SCALE=scale,
+-        BLOCK_D=cfg["BLOCK_D"],
+-        BLOCK_KV=BLOCK_KV,
+-        KEY_FP8=1 if key_fp8 else 0,
+-        NORM_CORRECTION=1 if norm_correction else 0,
+-        FP8_E4B15=fp8_e4b15,
+-        num_warps=1,
+-        num_stages=1,
+-    )
++    part_lens = seq_lens
++    if tokens_per_req > 0 and value_quant_bits in (3, 4):
++        # [levbush patch] групповое ядро (см. _tq_decode_stage1_grouped)
++        L = tokens_per_req
++        R = B // L
++        _tq_decode_stage1_grouped[(R, Hk, NUM_KV_SPLITS)](
++            q_rot,
++            kv_cache,
++            block_table,
++            seq_lens,
++            centroids,
++            mid_o,
++            q_rot.stride(0),
++            q_rot.stride(1),
++            kv_cache.stride(0),
++            kv_cache.stride(1),
++            kv_cache.stride(2),
++            block_table.stride(0),
++            mid_o.stride(0),
++            mid_o.stride(1),
++            mid_o.stride(2),
++            HEAD_DIM=D,
++            BLOCK_SIZE=block_size,
++            NUM_KV_SPLITS=NUM_KV_SPLITS,
++            KV_GROUP_SIZE=kv_group_size,
++            TOKENS_PER_REQ=L,
++            BLOCK_H=max(16, triton.next_power_of_2(L * kv_group_size)),
++            MSE_BITS=mse_bits,
++            MSE_BYTES=cfg["mse_bytes"],
++            KPS=key_packed_size,
++            VQB=value_quant_bits,
++            VAL_DATA_BYTES=cfg["val_data_bytes"],
++            ATTN_SCALE=scale,
++            BLOCK_D=cfg["BLOCK_D"],
++            BLOCK_KV=16 if L == 1 else 32,
++            KEY_FP8=1 if key_fp8 else 0,
++            NORM_CORRECTION=1 if norm_correction else 0,
++            FP8_E4B15=fp8_e4b15,
++            num_warps=4,
++            num_stages=1,
++        )
++        # stage2 делит KV на куски по длине последнего токена запроса — как stage1
++        # (contiguous: при R = 1 expand+reshape даёт вид с нулевым шагом, а ядро читает подряд)
++        part_lens = seq_lens.view(R, L)[:, L - 1 :].expand(R, L).reshape(B).contiguous()
++    else:
++      BLOCK_KV = 4
++      grid = (B, Hq, NUM_KV_SPLITS)
++      _tq_decode_stage1[grid](
++          q_rot,
++          kv_cache,
++          block_table,
++          seq_lens,
++          centroids,
++          mid_o,
++          q_rot.stride(0),
++          q_rot.stride(1),
++          kv_cache.stride(0),
++          kv_cache.stride(1),
++          kv_cache.stride(2),
++          block_table.stride(0),
++          mid_o.stride(0),
++          mid_o.stride(1),
++          mid_o.stride(2),
++          NUM_KV_HEADS=Hk,
++          HEAD_DIM=D,
++          BLOCK_SIZE=block_size,
++          NUM_KV_SPLITS=NUM_KV_SPLITS,
++          KV_GROUP_SIZE=kv_group_size,
++          MSE_BITS=mse_bits,
++          MSE_BYTES=cfg["mse_bytes"],
++          KPS=key_packed_size,
++          VQB=value_quant_bits,
++          VAL_DATA_BYTES=cfg["val_data_bytes"],
++          ATTN_SCALE=scale,
++          BLOCK_D=cfg["BLOCK_D"],
++          BLOCK_KV=BLOCK_KV,
++          KEY_FP8=1 if key_fp8 else 0,
++          NORM_CORRECTION=1 if norm_correction else 0,
++          FP8_E4B15=fp8_e4b15,
++          num_warps=1,
++          num_stages=1,
++      )
+ 
+     # Stage 2: Reduce across KV splits
+     # Output in query dtype — eliminates float16_copy kernel after stage2
+@@ -612,7 +835,7 @@
+         mid_o,
+         output,
+         lse,
+-        seq_lens,
++        part_lens,
+         mid_o.stride(0),
+         mid_o.stride(1),
+         mid_o.stride(2),
