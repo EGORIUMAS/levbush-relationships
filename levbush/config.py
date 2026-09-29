@@ -55,12 +55,12 @@ def _path(value: str) -> Path:
 
 @dataclass
 class Config:
-    bot_token: str = field(default_factory=lambda: env("BOT_TOKEN", ""))
+    bot_token: str = field(default_factory=lambda: env("BOT_TOKEN", ""), repr=False)
     admin_id: int = field(default_factory=lambda: env_int("ADMIN_ID", 0))
     group: str = field(default_factory=lambda: env("GROUP", ""))          # @username / id / ссылка; канал → его группа
     api_id: int = field(default_factory=lambda: env_int("API_ID", 0))
-    api_hash: str = field(default_factory=lambda: env("API_HASH", ""))
-    database_url: str = field(default_factory=lambda: env("DATABASE_URL", ""))
+    api_hash: str = field(default_factory=lambda: env("API_HASH", ""), repr=False)
+    database_url: str = field(default_factory=lambda: env("DATABASE_URL", ""), repr=False)
     webapp_url: str = field(default_factory=lambda: env("WEBAPP_URL", ""))
     # чьи сообщения от имени группы/канала: "-100…=@ник,-100…=@ник" (аноним-админ, пост от канала)
     aliases: str = field(default_factory=lambda: env("ALIASES", ""))
@@ -142,6 +142,25 @@ class Config:
 
     asr_python: str = field(default_factory=lambda: env("ASR_PYTHON", "/usr/bin/python3"))
 
+    # смысловой поиск /find: индекс в search.db рядом с cache.db (переписка — только локально)
+    search: bool = field(default_factory=lambda: env_bool("SEARCH", True))
+    embed_model: str = field(default_factory=lambda: env(
+        "EMBED_MODEL", "/mnt/shared/Models/jina-v5-omni-small-retrieval"))
+    embed_python: str = field(default_factory=lambda: env("EMBED_PYTHON", env("ASR_PYTHON", "/usr/bin/python3")))
+    embed_dim: int = field(default_factory=lambda: env_int("EMBED_DIM", 1024))        # Matryoshka: 256/512/768/1024
+    # индексация: auto — GPU, если очередь большая и видеокарта свободна (нет модели бота, генерации H3, хватает
+    # VRAM), иначе CPU; cpu / cuda — принудительно (но и cuda при модели бота, H3 или нехватке VRAM идёт на CPU)
+    embed_device: str = field(default_factory=lambda: env("EMBED_DEVICE", "auto"))
+    embed_need_gib: float = field(default_factory=lambda: env_float("EMBED_NEED_GIB", 6.0))
+    embed_gpu_min: int = field(default_factory=lambda: env_int("EMBED_GPU_MIN", 2000))  # меньше — на CPU
+    embed_threads: int = field(default_factory=lambda: env_int("EMBED_THREADS", 8))     # потоков torch на CPU
+    embed_max_pixels: int = field(default_factory=lambda: env_int("EMBED_MAX_PIXELS", 1310720))
+    embed_idle_min: int = field(default_factory=lambda: env_int("EMBED_IDLE_MIN", 15))  # эмбеддер запросов
+    search_interval: int = field(default_factory=lambda: env_int("SEARCH_INTERVAL", 300))
+    # фоновая дозаливка векторов — только пока очередь не больше этого; первичную (вся история) — /index run
+    search_auto_max: int = field(default_factory=lambda: env_int("SEARCH_AUTO_MAX", 3000))
+    find_per_page: int = field(default_factory=lambda: env_int("FIND_PER_PAGE", 7))
+
     daily_at: str = field(default_factory=lambda: env("DAILY_AT", "04:30"))
     stats_interval: int = field(default_factory=lambda: env_int("STATS_INTERVAL", 120))
     retell_tokens: int = field(default_factory=lambda: env_int("RETELL_TOKENS", 240000))  # один запрос пересказа (ctx 256k)
@@ -151,6 +170,10 @@ class Config:
     @property
     def cache_db(self) -> Path:
         return self.data_dir / "cache.db"
+
+    @property
+    def search_db(self) -> Path:
+        return self.data_dir / "search.db"
 
     def ensure_dirs(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)

@@ -70,6 +70,7 @@ async def served_models(base: str) -> list[dict]:
 
 class LLMManager:
     _start_lock: asyncio.Lock | None = None       # общий на все свои серверы: запускаем по одному
+    gpu_guests: list = []      # async-функции «освободи GPU» (эмбеддер поиска) — перед запуском модели
 
     def __init__(self, cfg: Config, notify=None, kind: str = "nemotron"):
         self.cfg = cfg
@@ -204,6 +205,8 @@ class LLMManager:
             await asyncio.sleep(30)
             waited += 30
         await self._free_peers()
+        for release in LLMManager.gpu_guests:
+            await release()
         free = gpu_free_gib()
         if free == free and free < self.need_gib and await self._qwen_awake():
             await self._say(f"Свободно {free:.1f} ГиБ VRAM — усыпляю vLLM-Qwen на время работы")

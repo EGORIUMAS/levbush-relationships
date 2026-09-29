@@ -8,6 +8,8 @@
   levbush migrate    применить sql/ к базе (для локального Postgres)
   levbush web        этап 2: локальный API + сайт
   levbush status     что в кэше
+  levbush index      индекс поиска /find: полнотекстовый + векторы (--device auto|cpu|cuda, --threads N)
+  levbush find ЗАПРОС  поиск по истории из консоли (как /find)
 """
 import argparse
 import asyncio
@@ -130,9 +132,60 @@ def _status():
           f"разобрано окон {q("select count(*) from analyzed where status = 'done'")}")
 
 
+async def _index(device: str, images: bool, threads: int | None):
+    from .cache import Cache
+    from .gpu import LLMManager
+    from .search import SearchService
+    if threads:
+        cfg.embed_threads = threads
+    svc = SearchService(cfg, Cache(cfg.cache_db))
+    print("полнотекстовый:", svc.indexer.sync())
+    text, img = svc.indexer.pending()
+    # модели бота — чтобы не занять GPU, пока они работают (сами они про консольную индексацию не знают)
+    servers = [LLMManager(cfg), LLMManager(cfg, kind="qwen")]
+    dev, why = svc.gpu_verdict(text + (img if images else 0), device, servers)
+    print(f"в очереди текстов {text}, картинок {img if images else 0} — {dev} ({why}), "
+          f"примерно {svc.estimate(text, img if images else 0, dev) // 60} мин")
+
+    async def progress(st):
+        print(f"\r{st['stage']}: {st['done']}/{st['total']}, осталось ~{st.get('eta', 0) // 60} мин  "
+              + st.get("note", ""), end="", flush=True)
+
+    try:
+        print("\n", await svc.run_index(device, servers=servers, progress=progress, images=images))
+    finally:
+        await svc.close()
+
+
+async def _find(query: str):
+    from datetime import datetime
+    import html
+    import re
+    from .cache import Cache
+    from .render import Renderer
+    from .search import SearchService, format_page
+    cache = Cache(cfg.cache_db)
+    svc = SearchService(cfg, cache)
+    try:
+        svc.indexer.sync()
+        q, hits, semantic = await svc.find(query, datetime.now(cfg.tz))
+        if q.error:
+            sys.exit(q.error)
+        text = format_page(hits, 0, 15, q, Renderer(cache, cfg), svc.sdb, svc.indexer.stem,
+                           lambda x: html.escape(str(x), quote=False), semantic)
+        print(html.unescape(re.sub(r"<[^>]+>", "", text)))
+    finally:
+        await svc.close()
+
+
 def main():
     p = argparse.ArgumentParser(prog="levbush", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["login", "run", "sync", "stats", "analyze", "migrate", "web", "status"])
+    p.add_argument("command", choices=["login", "run", "sync", "stats", "analyze", "migrate", "web", "status", "index",
+                                        "find"])
+    p.add_argument("query", nargs="*", help="find: запрос")
+    p.add_argument("--device", default=None, help="index: auto | cpu | cuda (по умолчанию LEVBUSH_EMBED_DEVICE)")
+    p.add_argument("--threads", type=int, default=None, help="index: потоков torch на CPU")
+    p.add_argument("--no-images", action="store_true", help="index: без фото")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8095)
     p.add_argument("-v", "--verbose", action="store_true")
@@ -156,6 +209,10 @@ def main():
         asyncio.run(serve(cfg, a.host, a.port))
     elif a.command == "status":
         _status()
+    elif a.command == "index":
+        asyncio.run(_index(a.device, not a.no_images, a.threads))
+    elif a.command == "find":
+        asyncio.run(_find(" ".join(a.query)))
 
 
 if __name__ == "__main__":

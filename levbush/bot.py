@@ -7,6 +7,7 @@ import asyncio
 import html
 import logging
 import re
+import secrets
 import time
 from datetime import datetime, timedelta
 
@@ -24,7 +25,9 @@ from .config import Config, cfg
 from .gpu import LLMManager, served_models
 from .normalize import from_ptb, ptb_chat_row, ptb_user_row, reaction_key
 from .remote import DB
+from .render import Renderer
 from .retell import Retell, md_to_tg
+from .search import EmbedError, SearchService, format_page
 from .tg_client import TG, SessionBusy
 
 log = logging.getLogger("levbush.bot")
@@ -94,6 +97,13 @@ class Levbush:
         self.last_stats = 0.0
         self.retell_lock = asyncio.Lock()
         self.bg: set[asyncio.Task] = set()
+        self.search: SearchService | None = None                                 # /find
+        if config.search:
+            try:
+                self.search = SearchService(config, self.cache)
+            except Exception:  # noqa: BLE001 — без поиска бот работает как раньше
+                log.exception("поиск не запустился")
+        self.finds: dict[str, dict] = {}          # выдачи /find для листания кнопками (в памяти, до 1 ч)
 
     # ================================================================ служебное
 
@@ -248,12 +258,14 @@ class Levbush:
             BotCommand("links", "связи человека"),
             BotCommand("retell", "пересказ: /retell 2ч | 14:30 | вчера 20:00 или ответом"),
             BotCommand("text", "расшифровка голосового или кружка (ответом; в личке — просто пришли)"),
+            BotCommand("find", "поиск по истории: /find о чём [@ник] [за:05.2026]"),
             BotCommand("map", "карта связей"),
             BotCommand("help", "справка"),
         ], scope=BotCommandScopeAllPrivateChats())
         await app.bot.set_my_commands([
             BotCommand("retell", "пересказ: /retell 2ч или ответом на сообщение"),
             BotCommand("text", "расшифровать голосовое или кружок (ответом)"),
+            BotCommand("find", "поиск по истории группы"),
             BotCommand("stats", "статистика"), BotCommand("top", "топ участников"),
             BotCommand("pair", "пара"), BotCommand("dossier", "досье"), BotCommand("map", "карта связей"),
         ], scope=BotCommandScopeAllGroupChats())
@@ -267,6 +279,8 @@ class Levbush:
         jq.run_repeating(self.job_media, interval=90, first=60)
         jq.run_repeating(self.job_reactions, interval=60, first=45)
         jq.run_repeating(self.job_participants, interval=6 * 3600, first=600)
+        if self.search:
+            jq.run_repeating(self.job_search, interval=self.cfg.search_interval, first=90)
         hh, mm = (int(x) for x in self.cfg.daily_at.split(":"))
         jq.run_daily(self.job_daily, time=datetime.now(self.cfg.tz).replace(hour=hh, minute=mm, second=0,
                                                                            microsecond=0).timetz())
@@ -298,6 +312,8 @@ class Levbush:
     async def post_shutdown(self, app: Application):
         for t in list(self.bg):
             t.cancel()
+        if self.search:
+            await self.search.close()
         for mgr in self.servers:
             if mgr._idle_task and not mgr._idle_task.done():
                 mgr._idle_task.cancel()
@@ -418,6 +434,64 @@ class Levbush:
                 self.dirty = True
             except Exception:  # noqa: BLE001
                 log.exception("участники")
+
+    async def job_search(self, ctx):
+        """Поиск: полнотекстовый индекс догоняет кэш (новые, правки, удаления); векторы для нового — если
+        первичная индексация уже прошла или очередь небольшая (всю историю запускает админ: /index run)."""
+        if not self.search or not self.initiated or self.maintenance or self.busy("индексация"):
+            return
+        try:
+            await asyncio.to_thread(self.search.indexer.sync)
+        except Exception:  # noqa: BLE001
+            log.exception("поиск: синхронизация")
+            return
+        text, img = self.search.indexer.pending()
+        if not (text or img) or not self.search.semantic_possible:
+            return
+        if not self.search.sdb.meta("backfilled") and text + img > self.cfg.search_auto_max:
+            return
+        self.spawn(self.index_run(), "индексация")
+
+    async def index_run(self, device: str | None = None, report: bool = False):
+        """Векторы для очереди поиска; report — прогресс админу (как у разбора, правится раз в 30 с)."""
+        msg, last = None, 0.0
+
+        async def progress(st):
+            nonlocal msg, last
+            if not report or time.monotonic() - last < 30:
+                return
+            last = time.monotonic()
+            text = self.index_text(st)
+            try:
+                if msg is None:
+                    msg = await self.app.bot.send_message(self.cfg.admin_id, text)
+                else:
+                    await msg.edit_text(text)
+            except TelegramError:
+                pass
+
+        try:
+            res = await self.search.run_index(device, servers=self.servers, progress=progress)
+        except EmbedError as exc:
+            if report:
+                await self.notify_admin(f"🔎 Индексация не запустилась: {exc}")
+            else:
+                log.info("индексация: %s", exc)
+            return
+        if report or res["text"] + res["images"] > 500:
+            await self.notify_admin(f"🔎 Индексация готова: текстов {res['text']}, картинок {res['images']}"
+                                    + (f", ошибок {res['errors']}" if res["errors"] else "")
+                                    + f" за {S.fmt_duration(res['seconds'])} ({res['why']})")
+
+    @staticmethod
+    def index_text(st: dict) -> str:
+        out = f"🔎 Индексация ({'GPU' if st.get('device') == 'cuda' else 'CPU'}): {st.get('stage', '')} " \
+              f"{st.get('done', 0)}/{st.get('total', 0)}"
+        if st.get("eta") is not None:
+            out += f", осталось ~{S.fmt_duration(st['eta']) if st['eta'] else 'меньше минуты'}"
+        if st.get("note"):
+            out += f"\n{st['note']}"
+        return out
 
     async def job_daily(self, ctx):
         if self.initiated and not self.maintenance and not self.busy("ежедневный разбор"):
@@ -557,10 +631,12 @@ class Levbush:
             "/dossier [@ник] — досье, /links [@ник] — связи\n"
             f"/retell 2ч | 30м | 14:30 | вчера 20:00 — пересказ (не дальше {self.cfg.retell_max_hours} ч), "
             "или ответом на сообщение — с него\n/text — расшифровка голосового или кружка (ответом на него; в личке "
-            "бота можно просто прислать голосовое)\n/map — карта связей")
+            "бота можно просто прислать голосовое)\n"
+            "/find о чём — поиск по смыслу во всей истории (и по фото); фильтры: @ник или от:имя, за:05.2026, "
+            "с:01.05 по:20.06, \"точная фраза\"; ответом на сообщение — похожие\n/map — карта связей")
         if self.is_admin(update):
             text += ("\n\nАдмин: /initiate (запуск сбора), /status, /analyze [stop], /describe (описать новые видео и "
-                     "голосовые Nemotron'ом сейчас), /sync, "
+                     "голосовые Nemotron'ом сейчас), /index [run [cpu|gpu] | stop] (векторы для /find), /sync, "
                      "/maintenance on [причина] | off — техобслуживание")
         btn = self.map_button(update)
         await self.reply(update, text, InlineKeyboardMarkup([[btn]]) if btn else None)
@@ -997,6 +1073,134 @@ class Levbush:
         for chunk in chunks[1:]:
             await answer_to.reply_text(chunk, parse_mode=ParseMode.HTML)
 
+    # ------------------------------------------------------------ поиск
+
+    async def cmd_find(self, update: Update, ctx):
+        """/find запрос [@ник | от:имя] [за:/с:/по: дата] ["фраза"] — смысловой + полнотекстовый поиск по истории.
+        Ответом на сообщение без запроса — похожие на него."""
+        if not await self.allowed(update):
+            return
+        m = update.effective_message
+        if not self.search:
+            await self.reply(update, "Поиск выключен (LEVBUSH_SEARCH=0).")
+            return
+        raw = " ".join(ctx.args).strip()
+        if not raw and m.reply_to_message:
+            r = m.reply_to_message
+            raw = (r.text or r.caption or "").replace("\n", " ")[:500]
+            if not raw and r.chat_id == self.chat_id:
+                it = self.search.sdb.db.execute("select body from items where msg_id = ?", (r.message_id,)).fetchone()
+                raw = (it["body"] if it else "").replace("\n", " ")[:500]
+            raw = re.sub(r'["«»@:]', " ", raw)                 # чужой текст — без фильтров и фраз
+        if not raw:
+            await self.reply(update, "🔎 <b>Поиск по истории группы</b> — по смыслу, а не только по словам; находит и "
+                                     "фото, расшифровки голосовых, описания видео.\n\n"
+                                     "<code>/find поездка в Питер</code>\n"
+                                     "<code>/find экзамен @ник</code> — только его сообщения (или <code>от:Имя</code>)\n"
+                                     "<code>/find шашлык за:05.2026</code> — за месяц (<code>за:вчера</code>, "
+                                     "<code>за:неделю</code>, <code>с:01.05 по:20.06</code>)\n"
+                                     "<code>/find \"точная фраза\"</code>\n"
+                                     "Ответом на сообщение без слов — похожие на него.")
+            return
+        cold = self.search.semantic and not self.search.qembed.alive
+        status = await m.reply_text("🔎 Ищу…" + (" (загружаю модель, ~10 с)" if cold else "")) if cold else None
+        try:
+            if time.time() - int(self.search.sdb.meta("synced") or 0) > 60:
+                await asyncio.to_thread(self.search.indexer.sync)      # свежие сообщения — в полнотекстовый
+            q, hits, semantic = await self.search.find(raw, datetime.now(self.cfg.tz))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("поиск")
+            text = f"❌ Поиск не удался: {esc(exc)}"
+            if status:
+                await status.edit_text(text, parse_mode=ParseMode.HTML)
+            else:
+                await self.reply(update, text)
+            return
+        if q.error:
+            text = f"🔎 {esc(q.error)}"
+            markup = None
+        else:
+            key = secrets.token_urlsafe(6)
+            now = time.time()
+            self.finds = {k: v for k, v in self.finds.items() if now - v["t"] < 3600}
+            if len(self.finds) > 200:
+                self.finds.pop(next(iter(self.finds)))
+            self.finds[key] = {"q": q, "hits": hits, "semantic": semantic, "t": now}
+            text, markup = self.find_page(key, 0)
+        if status:
+            await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=markup)
+        else:
+            await self.reply(update, text, markup)
+
+    def find_page(self, key: str, page: int):
+        f = self.finds[key]
+        per = self.cfg.find_per_page
+        r = Renderer(self.cache, self.cfg)
+        text = format_page(f["hits"], page, per, f["q"], r, self.search.sdb, self.search.indexer.stem, esc,
+                           f["semantic"])
+        pages = (len(f["hits"]) + per - 1) // per
+        row = []
+        if page > 0:
+            row.append(InlineKeyboardButton("◀", callback_data=f"fd:{key}:{page - 1}"))
+        if page + 1 < pages:
+            row.append(InlineKeyboardButton(f"Ещё ▶ ({page + 2}/{pages})", callback_data=f"fd:{key}:{page + 1}"))
+        return text, InlineKeyboardMarkup([row]) if row else None
+
+    async def cmd_index(self, update: Update, ctx):
+        """/index — состояние индекса поиска; /index run [cpu|gpu] — векторы для очереди (первый раз — вся
+        история); /index stop."""
+        if not self.is_admin(update):
+            return
+        if not self.search:
+            await self.reply(update, "Поиск выключен (LEVBUSH_SEARCH=0).")
+            return
+        arg = (ctx.args[0].lower() if ctx.args else "")
+        if arg in ("stop", "стоп"):
+            tasks = [t for t in self.bg if t.get_name() == "индексация"]
+            for t in tasks:
+                t.cancel()
+            await self.reply(update, "⏹ Индексация остановлена, посчитанное сохранено." if tasks else "Индексация не идёт.")
+            return
+        if arg in ("run", "go", "старт"):
+            if self.busy("индексация"):
+                await self.reply(update, "Уже идёт — /index.")
+                return
+            dev = {"gpu": "cuda", "cuda": "cuda", "cpu": "cpu"}.get(ctx.args[1].lower() if len(ctx.args) > 1 else "")
+            await asyncio.to_thread(self.search.indexer.sync)
+            text, img = self.search.indexer.pending()
+            where, why = self.search.gpu_verdict(text + img, dev, self.servers)
+            self.spawn(self.index_run(dev, report=True), "индексация")
+            await self.reply(update, f"🔎 Запускаю: текстов {text}, картинок {img} — {'GPU' if where == 'cuda' else 'CPU'} "
+                                     f"({esc(why)}), примерно {S.fmt_duration(self.search.estimate(text, img, where))}. "
+                                     f"Прогресс пришлю; остановить — /index stop.")
+            return
+        await self.reply(update, self.search_status())
+
+    def search_brief(self) -> str:
+        c = self.search.sdb.counts()
+        return (f"Поиск: {c['items']} сообщений, векторов {c['text_vecs']} + фото {c['images']}"
+                + (f", в очереди {c['text_todo']} + {c['images_todo']}" if c["text_todo"] or c["images_todo"] else ""))
+
+    def search_status(self) -> str:
+        c = self.search.sdb.counts()
+        text, img = c["text_todo"], c["images_todo"]
+        lines = [f"🔎 <b>Индекс поиска</b>: сообщений {c['items']} (по словам — {c['fts']})",
+                 f"векторы текстов: {c['text_vecs']}" + (f", в очереди {text}" if text else ""),
+                 f"фото: {c['images']}" + (f", в очереди {img}" if img else "")
+                 + (f", не открылось {c['images_error']}" if c["images_error"] else "")]
+        if not self.search.semantic_possible:
+            lines.append(f"⚠️ нет модели {esc(self.cfg.embed_model)} — только поиск по словам")
+        st = self.search.indexer.state
+        if st:
+            lines.append(self.index_text(st))
+        elif text or img:
+            dev, why = self.search.gpu_verdict(text + img, None, self.servers)
+            lines.append(f"Сейчас посчиталось бы на {'GPU' if dev == 'cuda' else 'CPU'} ({esc(why)}) примерно за "
+                         f"{S.fmt_duration(self.search.estimate(text, img, dev))} — /index run [cpu|gpu]")
+            if not self.search.sdb.meta("backfilled") and text + img > self.cfg.search_auto_max:
+                lines.append("Первичная индексация ещё не проходила: сама не запустится.")
+        return "\n".join(lines)
+
     # ------------------------------------------------------------ админ
 
     async def cmd_status(self, update: Update, ctx):
@@ -1019,6 +1223,7 @@ class Levbush:
             if self.last_stats else "Статистика ещё не выгружалась",
             *[f"{m.label}: {'работает' if await m.is_up() else 'не запущен'}" for m in self.servers],
             f"Описаний медиа: {c.execute('select count(*) from media_desc where text <> \'\'').fetchone()[0]}",
+            *([self.search_brief()] if self.search else []),
             (self.progress_text(st) or f"Разбор: {esc(st.get('state', '—'))} {esc(st.get('stage', ''))}"),
             f"Сбор: {'запущен' if self.initiated else 'не запускался (/initiate)'}; очередь реакций "
             f"{c.execute('select count(*) from reaction_todo').fetchone()[0]}; темп ×{self.tg.slow:g}, "
@@ -1200,6 +1405,14 @@ class Levbush:
                     await self.send_rich(q.message, md, await self.dossier_text(int(rest)))
             elif kind == "ln":
                 await q.message.reply_text(await self.links_text(int(rest)), parse_mode=ParseMode.HTML)
+            elif kind == "fd":
+                key, page = rest.rsplit(":", 1)
+                if key not in self.finds:
+                    await q.answer("Выдача устарела — повтори /find", show_alert=True)
+                    return
+                text, markup = self.find_page(key, int(page))
+                await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                          disable_web_page_preview=True)
             elif kind == "an" and self.is_admin(update):
                 if rest == "run" and not self.analyzer.running:
                     self.cache.set("analysis_started", int(time.time()))
@@ -1223,7 +1436,8 @@ def build(config: Config = cfg) -> Application:
     cmds = {"help": lb.cmd_help, "start": lb.cmd_help, "stats": lb.cmd_stats, "me": lb.cmd_me, "top": lb.cmd_top,
             "pair": lb.cmd_pair, "dossier": lb.cmd_dossier, "links": lb.cmd_links, "map": lb.cmd_map,
             "retell": lb.cmd_retell, "status": lb.cmd_status, "analyze": lb.cmd_analyze, "sync": lb.cmd_sync,
-            "initiate": lb.cmd_initiate, "text": lb.cmd_text, "describe": lb.cmd_describe}
+            "initiate": lb.cmd_initiate, "text": lb.cmd_text, "describe": lb.cmd_describe, "find": lb.cmd_find,
+            "index": lb.cmd_index}
     cmds["maintenance"] = lb.cmd_maintenance
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, lb.guard(fn)), group=1)
