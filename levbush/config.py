@@ -106,9 +106,16 @@ class Config:
     qwen_url: str = field(default_factory=lambda: env("QWEN_URL", "http://127.0.0.1:18091").rstrip("/"))
     qwen_model_path: str = field(default_factory=lambda: env("QWEN_MODEL_PATH", "/mnt/shared/Models/qwen38-27b-nvfp4"))
     qwen_name: str = field(default_factory=lambda: env("QWEN_NAME", "qwen3.8-27b"))
-    # KV TurboQuant k8v4 при 0,92 VRAM вмещает ~192k токенов (fp8 — 153k); 176k — с запасом
+    # потолок контекста для запросов; сервер берёт, сколько влезет (KV k8v4 при 0,92 VRAM — ~197k, fp8 — 153k)
     qwen_ctx: int = field(default_factory=lambda: env_int("QWEN_CTX", 180224))
+    # потолок доли VRAM; фактическая — от свободной памяти минус QWEN_HEADROOM_GIB (рабочий стол на той же карте)
     qwen_util: float = field(default_factory=lambda: env_float("QWEN_UTIL", 0.92))
+    # запас: ~1,05 ГиБ vLLM держит сверх доли после прогрева, остальное — рабочему столу (лок-скрин падал при 0,9
+    # свободных). Замер 30.09 при 30 ГиБ свободных: запас 2,7 → контекст 122k и 2,1 ГиБ свободно; 2,2 → ~140k и ~1,6
+    qwen_headroom_gib: float = field(default_factory=lambda: env_float("QWEN_HEADROOM_GIB", 2.2))
+    # запас, когда запущен Hyprland (рабочий стол на той же 5090): при 2,2 свободно оставалось ~0,9 ГиБ, и Telegram
+    # перерисовывался, только когда окно теряло/получало фокус. +1 ГиБ ≈ −36k токенов контекста
+    qwen_headroom_desktop_gib: float = field(default_factory=lambda: env_float("QWEN_HEADROOM_DESKTOP_GIB", 3.2))
     # 1 слот: при двух запросах с картинками и MTP vLLM 0.27.1 падает (cudaErrorIllegalAddress); пересказ во время
     # разбора встаёт в очередь за текущим шагом
     qwen_seqs: int = field(default_factory=lambda: env_int("QWEN_SEQS", 1))
@@ -116,7 +123,8 @@ class Config:
     # KV-кэш Qwen: TurboQuant с MTP работает только с патчем vLLM (deploy/vllm-0.27.1-turboquant-mtp.patch),
     # без патча — fp8 (и QWEN_CTX не больше 150k)
     qwen_kv: str = field(default_factory=lambda: env("QWEN_KV", "turboquant_k8v4"))
-    qwen_need_gib: float = field(default_factory=lambda: env_float("QWEN_NEED_GIB", 29.0))   # 0,92 × 31,4
+    # меньше свободной — не запускать: контекст выйдет меньше ~105k
+    qwen_need_gib: float = field(default_factory=lambda: env_float("QWEN_NEED_GIB", 29.0))
     video_frames: int = field(default_factory=lambda: env_int("VIDEO_FRAMES", 4))  # кадров видео/GIF для Qwen
     qwen_images: int = field(default_factory=lambda: env_int("QWEN_IMAGES", 40))   # картинок в одном запросе к Qwen
     # шаг разбора: несколько последовательных окон + контекст + текущие досье и связи
@@ -170,6 +178,23 @@ class Config:
     retell_tokens: int = field(default_factory=lambda: env_int("RETELL_TOKENS", 240000))  # один запрос пересказа (ctx 256k)
     retell_think_budget: int = field(default_factory=lambda: env_int("RETELL_THINK_BUDGET", 1024))  # 0 — без рассуждения
     retell_max_hours: int = field(default_factory=lambda: env_int("RETELL_MAX_HOURS", 48))
+    # обращение «@бот …» в начале сообщения: хвост переписки до него + список досье, полные — инструментом
+    ask: bool = field(default_factory=lambda: env_bool("ASK", True))
+    ask_context_hours: int = field(default_factory=lambda: env_int("ASK_CONTEXT_HOURS", 12))
+    ask_context_msgs: int = field(default_factory=lambda: env_int("ASK_CONTEXT_MSGS", 80))
+    ask_context_tokens: int = field(default_factory=lambda: env_int("ASK_CONTEXT_TOKENS", 12000))
+    ask_bot_msg_chars: int = field(default_factory=lambda: env_int("ASK_BOT_MSG_CHARS", 1500))  # длинные ответы бота
+    ask_media_tokens: int = field(default_factory=lambda: env_int("ASK_MEDIA_TOKENS", 12000))   # картинки обращения
+    ask_max_dossiers: int = field(default_factory=lambda: env_int("ASK_MAX_DOSSIERS", 6))      # за один вызов
+    ask_tool_rounds: int = field(default_factory=lambda: env_int("ASK_TOOL_ROUNDS", 6))   # досье, поиск, страницы
+    ask_max_tokens: int = field(default_factory=lambda: env_int("ASK_MAX_TOKENS", 2000))
+    ask_think_budget: int = field(default_factory=lambda: env_int("ASK_THINK_BUDGET", 4096))  # 0 — без рассуждения
+    ask_queue: int = field(default_factory=lambda: env_int("ASK_QUEUE", 4))     # больше ждущих — «подожди»
+    # интернет в разговоре: свой SearXNG (docker searxng, 127.0.0.1:8890); пусто — без web_search и web_fetch
+    web_search_url: str = field(default_factory=lambda: env("WEB_SEARCH_URL", "http://127.0.0.1:8890").rstrip("/"))
+    web_results: int = field(default_factory=lambda: env_int("WEB_RESULTS", 6))
+    web_fetch_chars: int = field(default_factory=lambda: env_int("WEB_FETCH_CHARS", 10000))   # текста страницы модели
+    web_fetch_max_mb: float = field(default_factory=lambda: env_float("WEB_FETCH_MAX_MB", 5))
 
     @property
     def cache_db(self) -> Path:

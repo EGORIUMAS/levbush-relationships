@@ -119,7 +119,7 @@ class Retell:
                        int(shared[0].get("max_model_len") or 131072))
                 return
         async with q.use():
-            yield L.LLM(q.url, q.model or q.fixed_model), self.cfg.qwen_ctx
+            yield L.LLM(q.url, q.model or q.fixed_model), q.ctx(self.cfg.qwen_ctx)
 
     async def _run(self, llm, ctx, rows, since_ts, now, limit_chars, progress) -> str:
         chat = self.a.chat

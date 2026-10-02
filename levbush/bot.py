@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta
 
 from telegram import (BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, InlineKeyboardButton,
-                      InlineKeyboardMarkup, MenuButtonWebApp, Update, WebAppInfo)
+                      InlineKeyboardMarkup, MenuButtonWebApp, ReplyParameters, Update, WebAppInfo)
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (AIORateLimiter, Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler,
@@ -20,12 +20,14 @@ from telegram.ext import (AIORateLimiter, Application, CallbackQueryHandler, Cha
 
 from . import stats as S
 from .analyze import Analyzer
+from .ask import Ask
 from .cache import Cache
 from .config import Config, cfg
+from .emoji import EmojiMap
 from .gpu import LLMManager, served_models
 from .normalize import from_ptb, ptb_chat_row, ptb_user_row, reaction_key
 from .remote import DB
-from .render import Renderer
+from .render import Renderer, link_msgs
 from .retell import Retell, md_to_tg
 from .search import EmbedError, SearchService, format_page
 from .tg_client import TG, SessionBusy
@@ -92,6 +94,10 @@ class Levbush:
         self.progress_edit = 0.0
         self.analyzer: Analyzer | None = None
         self.retell: Retell | None = None
+        self.ask: Ask | None = None                # обращения «@бот …»
+        self.ask_lock = asyncio.Lock()
+        self.ask_waiting = 0
+        self.emoji = EmojiMap(self.cache)          # эмодзи ответов → анимированные премиум-эмодзи
         self.app: Application | None = None
         self.dirty = True
         self.last_stats = 0.0
@@ -250,6 +256,11 @@ class Levbush:
         self.analyzer = Analyzer(self.cfg, self.cache, self.db, self.mgr, notify=self.notify_admin, qwen=self.qwen)
         self.analyzer.on_progress = self.show_progress
         self.retell = Retell(self.analyzer)
+        self.ask = Ask(self.analyzer, self.retell)
+        try:
+            await self.emoji.load(app.bot)
+        except Exception:  # noqa: BLE001 — без премиум-эмодзи ответы уйдут обычными
+            log.exception("анимированные эмодзи")
         await app.bot.set_my_commands([
             BotCommand("stats", "статистика: /stats [@ник] или ответом"),
             BotCommand("me", "моя статистика"),
@@ -591,6 +602,122 @@ class Levbush:
             self.cache.add_membership(user.id, date, "leave", "bot")
         self.dirty = True
 
+    # ================================================================ обращения: «@бот …» в начале сообщения
+
+    def asks_bot(self, m) -> bool:
+        name = self.app.bot.username if self.app else None
+        text = m.text or m.caption or ""
+        return bool(name) and re.match(rf"@{re.escape(name)}(?!\w)", text, re.I) is not None
+
+    def store_own(self, msg_id: int, date: int, text: str, reply_to: int | None):
+        """Свой ответ — сразу в кэш (Telethon принесёт его позже): следующее обращение увидит его репликой модели.
+        Текст — Markdown ответа: rich-сообщение PTB не разбирает, а Telethon может принести его без текста."""
+        row = {"id": msg_id, "date": date, "sender_id": self.app.bot.id, "text": text, "reply_to": reply_to,
+               "source": "bot"}
+        with self.cache.tx() as db:
+            self.cache.upsert_user(ptb_user_row(self.app.bot.bot), db)
+            self.cache.upsert_message(row, db)
+
+    async def on_ask(self, update: Update, ctx):
+        m = update.effective_message
+        if m is None or not self.cfg.ask or not self.in_group(update) or not self.asks_bot(m):
+            return
+        await self.guard(self.start_ask)(update, ctx)       # техобслуживание — только для обращений, не для всех
+
+    async def start_ask(self, update: Update, ctx):
+        m = update.effective_message
+        if not self.initiated:
+            await m.reply_text("Сбор переписки ещё не запущен — мне не на что опереться.")
+            return
+        if self.ask_waiting >= self.cfg.ask_queue:
+            await m.reply_text("⏳ Уже отвечаю на другие вопросы — спроси чуть позже.")
+            return
+        self.ask_waiting += 1
+        self.spawn(self._ask(m), "обращение")
+
+    async def _typing(self, chat_id: int):
+        while True:
+            try:
+                await self.app.bot.send_chat_action(chat_id, "typing")
+            except TelegramError:
+                pass
+            await asyncio.sleep(4.5)
+
+    async def _ask(self, m):
+        status = typing = None
+        try:
+            async with self.ask_lock:
+                if self.tg_ok and m.effective_attachment:
+                    await self.tg.download_since(int(m.date.timestamp()) - 5, limit=20)   # картинка обращения
+                q = self.qwen
+                if q and not await q.is_up() and not self.mgr.unit_active() \
+                        and not await served_models(self.cfg.fallback_llm_url):
+                    status = await m.reply_text(f"⏳ Поднимаю {q.label} (~1–2 мин), потом отвечу…")
+                elif self.analyzer.running:
+                    status = await m.reply_text("⏳ Нейросеть сейчас разбирает переписку — отвечу после текущего шага.")
+                typing = asyncio.create_task(self._typing(m.chat_id))
+                text = await self.ask.answer(m.message_id, self.app.bot.id, self.app.bot.first_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.exception("обращение")
+            text = None
+            error = f"❌ Не получилось ответить: {esc(exc)}"
+        finally:
+            self.ask_waiting -= 1
+            if typing:
+                typing.cancel()
+            if status:
+                try:
+                    await status.delete()
+                except TelegramError:
+                    pass
+        if text is None:
+            await self.app.bot.send_message(m.chat_id, error, parse_mode=ParseMode.HTML, reply_parameters=ReplyParameters(
+                m.message_id, allow_sending_without_reply=True))
+            return
+        await self.send_answer(m, text)
+
+    @staticmethod
+    def rich_answer(md: str) -> str:
+        """Markdown нейросети → Rich Markdown: < и == там — HTML и выделение, экранируем; вне формул $…$ и кода."""
+        parts = re.split(r"(```.*?```|`[^`\n]*`|\$[^$\n]+\$)", md, flags=re.S)
+        return "".join(x if i % 2 else x.replace("<", "\\<").replace("==", "=\\=") for i, x in enumerate(parts))
+
+    async def send_answer(self, m, md: str):
+        """Ответ нейросети: rich-сообщение (Markdown, формулы) с анимированными премиум-эмодзи; одно эмодзи — отдельно
+        (Telegram показывает его крупным). Не прошло — HTML с премиум-эмодзи, потом HTML без них."""
+        chat = self.chat
+        one = self.emoji.single(md)
+        plain = esc(one) if one else md_to_tg(md, chat)
+        tries = [("html", self.emoji.html(plain))]
+        if not one and getattr(self, "_rich_ok", True):
+            # < и == Rich Markdown понимает как HTML и выделение; $…$ (формулы) и ||спойлеры|| — оставляем
+            rich = self.emoji.markdown(link_msgs(self.rich_answer(md), chat))
+            if len(rich) <= 32000:
+                tries.insert(0, ("rich", rich))
+        tries.append(("html", plain))
+        reply = ReplyParameters(m.message_id, allow_sending_without_reply=True)
+        for kind, body in tries:
+            try:
+                if kind == "rich":
+                    r = await self.app.bot.do_api_request("sendRichMessage", api_kwargs={
+                        "chat_id": m.chat_id, "rich_message": {"markdown": body}, "reply_parameters": reply.to_dict()})
+                    self.store_own(r["message_id"], r["date"], md, m.message_id)
+                    return
+                sent = None
+                for chunk in split_html(body):
+                    sent = await self.app.bot.send_message(m.chat_id, chunk, parse_mode=ParseMode.HTML,
+                                                           disable_web_page_preview=True, reply_parameters=reply)
+                self.store_own(sent.message_id, int(sent.date.timestamp()), md, m.message_id)
+                return
+            except TelegramError as exc:
+                if kind == "rich" and "not found" in str(exc).lower() and "method" in str(exc).lower():
+                    self._rich_ok = False
+                log.warning("ответ (%s) не прошёл: %s", kind, exc)
+        await self.app.bot.send_message(m.chat_id, re.sub(r"<[^>]+>", "", plain)[:4000], reply_parameters=reply)
+
+
     # ================================================================ команды: разбор аргументов
 
     async def target(self, update: Update, args: list[str], default_self=True):
@@ -634,10 +761,13 @@ class Levbush:
             "или ответом на сообщение — с него\n/text — расшифровка голосового или кружка (ответом на него; в личке "
             "бота можно просто прислать голосовое)\n"
             "/find о чём — поиск по смыслу во всей истории (и по фото); фильтры: @ник или от:имя, за:05.2026, "
-            "с:01.05 по:20.06, \"точная фраза\"; ответом на сообщение — похожие\n/map — карта связей")
+            "с:01.05 по:20.06, \"точная фраза\"; ответом на сообщение — похожие\n/map — карта связей\n\n"
+            f"В группе можно поговорить с нейросетью: начни сообщение с @{esc(self.app.bot.username)} — она видит "
+            "недавнюю переписку и досье участников.")
         if self.is_admin(update):
             text += ("\n\nАдмин: /initiate (запуск сбора), /status, /analyze [stop], /describe (описать новые видео и "
                      "голосовые Nemotron'ом сейчас), /index [run [cpu|gpu] | stop] (векторы для /find), /sync, "
+                     "/qwen [stop [force]] (свой Qwen: состояние, остановить), "
                      "/maintenance on [причина] | off — техобслуживание")
         btn = self.map_button(update)
         await self.reply(update, text, InlineKeyboardMarkup([[btn]]) if btn else None)
@@ -1263,6 +1393,37 @@ class Levbush:
         self.spawn(self.analyzer.run("вручную"), "разбор")
         await self.reply(update, "🧠 Запустил разбор. Прогресс — /status и на карте.")
 
+    async def cmd_qwen(self, update: Update, ctx):
+        """/qwen — состояние своего Qwen; /qwen stop [force] — погасить (освободить VRAM), не дожидаясь простоя."""
+        if not self.is_admin(update):
+            return
+        q = self.qwen
+        if q is None:
+            await self.reply(update, "Свой Qwen не настроен (LEVBUSH_QWEN_MODEL_PATH).")
+            return
+        args = [a.lower() for a in ctx.args]
+        if not args or args[0] not in ("stop", "стоп"):
+            up = await q.is_up()
+            state = (f"работает, контекст {q.max_len // 1024}k" if up and q.max_len else "работает" if up
+                     else "запускается" if q.unit_active() else "не запущен")
+            idle = (f", простаивает {S.fmt_duration(time.monotonic() - q.last_used)}"
+                    if up and q.last_used and not q.users else "")
+            await self.reply(update, f"{esc(q.label)}: {state}" + (f", запросов {q.users}" if q.users else "")
+                             + idle + "\n/qwen stop — остановить")
+            return
+        if not q.unit_active():
+            await self.reply(update, f"{esc(q.label)} и так не запущен.")
+            return
+        force = "force" in args[1:]
+        if (q.users or self.analyzer.running) and not force:
+            why = "идёт разбор (сначала /analyze stop — иначе он поднимет Qwen снова)" if self.analyzer.running \
+                else f"сейчас им пользуются ({q.users})"
+            await self.reply(update, f"⚠️ {esc(q.label)} занят: {why}. Погасить всё равно — /qwen stop force.")
+            return
+        async with q._lock:
+            await q.stop()
+        await self.reply(update, f"💤 {esc(q.label)} остановлен, VRAM свободна.")
+
     async def cmd_describe(self, update: Update, ctx):
         """Nemotron описывает новые голосовые, кружки, видео и GIF сейчас, не дожидаясь ежедневного разбора."""
         if not self.is_admin(update):
@@ -1450,7 +1611,7 @@ def build(config: Config = cfg) -> Application:
             "pair": lb.cmd_pair, "dossier": lb.cmd_dossier, "links": lb.cmd_links, "map": lb.cmd_map,
             "retell": lb.cmd_retell, "status": lb.cmd_status, "analyze": lb.cmd_analyze, "sync": lb.cmd_sync,
             "initiate": lb.cmd_initiate, "text": lb.cmd_text, "describe": lb.cmd_describe, "find": lb.cmd_find,
-            "index": lb.cmd_index}
+            "index": lb.cmd_index, "qwen": lb.cmd_qwen}
     cmds["maintenance"] = lb.cmd_maintenance
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, lb.guard(fn)), group=1)
@@ -1458,6 +1619,9 @@ def build(config: Config = cfg) -> Application:
     app.add_handler(MessageHandler(filters.ALL, lb.on_message), group=0)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO),
                                    lb.on_private_speech), group=2)
+    # «@бот …» в начале сообщения — разговор с нейросетью (после сбора: обращение уже в кэше)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+                                   lb.on_ask), group=3)
     app.add_handler(MessageReactionHandler(lb.on_reaction, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED), group=0)
     app.add_handler(MessageReactionHandler(lb.on_reaction_count, message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_COUNT_UPDATED), group=0)
     app.add_handler(ChatMemberHandler(lb.on_member, ChatMemberHandler.CHAT_MEMBER), group=0)

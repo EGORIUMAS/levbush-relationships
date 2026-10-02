@@ -218,7 +218,7 @@ class Analyzer:
 
     @property
     def ctx(self) -> int:
-        return self.cfg.qwen_ctx if self.qwen else self.cfg.llm_ctx
+        return self.qwen.ctx(self.cfg.qwen_ctx) if self.qwen else self.cfg.llm_ctx
 
     def budget(self, tokens: int):
         """Бюджет вложений запроса к модели разбора (у Qwen свой лимит картинок)."""

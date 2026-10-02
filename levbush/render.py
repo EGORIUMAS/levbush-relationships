@@ -59,8 +59,10 @@ def visible(text: str | None) -> bool:
 
 
 class Renderer:
-    def __init__(self, cache: Cache, cfg: Config):
+    def __init__(self, cache: Cache, cfg: Config, marks: dict[int, str] | None = None):
+        """marks — пометки к именам (uid → «создатель бота»), как «[бот]»: видны и в коротком имени."""
         self.cache, self.cfg = cache, cfg
+        self.marks = marks or {}
         self.chat = cache.get("chat", {}) or {}
         self._names = {}
         self.alias = cache.aliases(cfg.aliases)
@@ -82,6 +84,8 @@ class Renderer:
             label = " ".join(x for x in (u["first_name"], u["last_name"]) if visible(x)) or (u["username"] or f"id{uid}")
             if u["is_bot"]:
                 label += " [бот]"            # до ника: short() его сохраняет — нейросеть не примет бота за человека
+            if uid in self.marks:
+                label += f" [{self.marks[uid]}]"
             if u["username"]:
                 label += f" (@{u['username']})"
         if uid == self.chat.get("channel_id"):

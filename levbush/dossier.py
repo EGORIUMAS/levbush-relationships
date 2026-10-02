@@ -151,7 +151,8 @@ def apply_relation(data: dict, ops: dict, a: int, b: int, day_of) -> int:
 
 # ------------------------------------------------------------ для нейросети (с id записей)
 
-def prompt_person(data: dict | None) -> str:
+def prompt_person(data: dict | None, ids: bool = True) -> str:
+    """ids=False — без номеров записей (для разговора: править досье там нельзя)."""
     if not data or not (data["entries"] or data.get("names")):
         return "Досье пока нет."
     out = []
@@ -167,7 +168,8 @@ def prompt_person(data: dict | None) -> str:
         for e in items:
             mark = _mark(e, " ({})")
             when = f"с {e['since']}" + (f", изм. {e['changed']}" if e["changed"] else "")
-            out.append(f"  [{e['id']}] {e['text']}{mark} ({when})")
+            num = f"[{e['id']}] " if ids else ""
+            out.append(f"  {num}{e['text']}{mark} ({when})")
     return "\n".join(out)
 
 

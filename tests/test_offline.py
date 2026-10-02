@@ -581,3 +581,123 @@ def test_compact_person():
     assert set(texts) == {"пьёт квас", "школьник"}                       # e4 не упомянута — осталась
     assert texts["школьник"]["since"] == "2025-01-01" and texts["школьник"]["msgs"] == [1, 2]
     assert texts["школьник"]["id"] == "e5" and [e["id"] for e in d["archive"][0]["entries"]] == ["e1", "e2", "e3"]
+
+
+def test_ask(tmp_path):
+    """Обращение «@бот …»: свои сообщения бота — репликами assistant, чужие — user; досье — инструментом."""
+    from contextlib import asynccontextmanager
+    from levbush.ask import Ask
+    from levbush.dossier import empty_dossier
+    BOT = 999
+    cfg = Config()
+    cfg.data_dir, cfg.media_dir = tmp_path / "d", tmp_path / "m"
+    cfg.session_file = tmp_path / "s" / "s"
+    cfg.ensure_dirs()
+    cache = Cache(cfg.cache_db)
+    cache.set("chat", {"id": CHAT, "title": "Тест"})
+    for uid, name, uname, bot in ((A, "Аня", "anya", 0), (B, "Боря", "borya", 0), (BOT, "Levbush", "lb_bot", 1)):
+        cache.upsert_user({"id": uid, "first_name": name, "username": uname, "is_bot": bot, "is_member": 1})
+    t = NOW - 600
+    msgs = [dict(id=1, date=t - 20 * 3600, sender_id=A, text="старое, за пределами окна"),
+            dict(id=2, date=t, sender_id=BOT, text="📊 Аня — 10 сообщений"),
+            dict(id=3, date=t + 10, sender_id=A, text="а Боря где?"),
+            dict(id=4, date=t + 20, sender_id=B, text="тут я"),
+            dict(id=5, date=t + 30, sender_id=BOT, text="Привет! Я бот."),
+            dict(id=6, date=t + 40, sender_id=A, text="@lb_bot что любит Боря?", reply_to=4)]
+    with cache.tx() as db:
+        for m in msgs:
+            cache.upsert_message(m, db)
+    dossier = empty_dossier()
+    dossier["names"] = ["Боря", "Борис"]
+    dossier["entries"] = [{"id": "e1", "section": next(iter(__import__("levbush.dossier").dossier.SECTIONS)),
+                           "text": "любит шахматы", "since": "2026-09-01", "changed": None, "removed": None,
+                           "msgs": [], "basis": "own"}]
+
+    class Pool:
+        async def fetch(self, sql, *a):
+            return [{"id": B, "name": "Боря", "username": "borya", "summary": "шахматист", "names": ["Боря", "Борис"]}]
+
+    class FakeDB:
+        pool = Pool()
+
+        async def dossier(self, uid):
+            return {"data": dossier, "as_of": datetime(2026, 9, 30)} if uid == B else None
+
+        async def find_person(self, q):
+            return {"id": B} if q.lstrip("@") == "borya" else None
+
+    seen = []
+
+    class FakeLLM:
+        model = "qwen3.8-27b"
+
+        async def chat(self, messages, tools=None, **kw):
+            seen.append((list(messages), tools))
+            if tools and not any(m["role"] == "tool" for m in messages):
+                return {"content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {
+                    "name": "get_dossier", "arguments": json.dumps({"people": [B, "@borya"]})}}]}
+            reply = "**Шахматы** [→](msg:4)"
+            return {"content": reply} if tools else reply
+
+    class FakeRetell:
+        @asynccontextmanager
+        async def server(self):
+            yield FakeLLM(), 100000
+
+    an = Analyzer(cfg, cache, FakeDB(), None)
+
+    async def no_asr(*a, **kw):
+        return 0
+
+    an.transcribe_pending = no_asr
+    ask = Ask(an, FakeRetell())
+    rows = ask.context_rows(6)
+    assert [m["id"] for m in rows] == [2, 3, 4, 5, 6]
+    turns = ask.history(rows, BOT, cache.message(6))
+    assert [x["role"] for x in turns] == ["user", "assistant", "user", "assistant", "user"]
+    assert turns[1]["content"] == "📊 Аня — 10 сообщений" and turns[3]["content"] == "Привет! Я бот."
+    assert "#3" in turns[2]["content"] and "#4" in turns[2]["content"]
+    assert turns[-1]["content"].startswith("Обращение к тебе:") and "#6" in turns[-1]["content"]
+
+    out = asyncio.run(ask.answer(6, BOT, "Levbush"))
+    assert out == "**Шахматы** [→](msg:4)"
+    first, second = seen[0][0], seen[1][0]
+    assert "Боря (@borya), id 102; как называют: Боря, Борис — шахматист" in first[0]["content"]
+    assert "нейросеть Qwen 3.8 27B" in first[0]["content"] and "«↩Levbush»" in first[0]["content"]
+    cfg.admin_id = A                                     # создатель помечен в переписке
+    ask = Ask(an, FakeRetell())
+    assert "#3 " in ask.history(rows, BOT, cache.message(6))[2]["content"]
+    assert "Аня [создатель бота]:" in ask.history(rows, BOT, cache.message(6))[2]["content"]
+    assert [m["role"] for m in first[1:]] == ["user", "assistant", "user", "assistant", "user"]
+    tool = [m for m in second if m["role"] == "tool"][0]["content"]
+    assert "любит шахматы" in tool and "[e1]" not in tool and tool.count("### Боря") == 2
+
+
+def test_emoji_map(tmp_path):
+    from levbush.emoji import EmojiMap
+    cache = Cache(tmp_path / "c.db")
+    cache.set("emoji_map", {"at": 0, "ids": {"😂": "1", "❤️": "2", "👍": "3", "👍🏽": "4", "👨‍💻": "5"}})
+    em = EmojiMap(cache)
+    assert em.markdown("ахах 😂 ❤ 👍🏽 👨‍💻") == ("ахах ![😂](tg://emoji?id=1) ![❤](tg://emoji?id=2) "
+                                            "![👍🏽](tg://emoji?id=4) ![👨‍💻](tg://emoji?id=5)")
+    assert em.markdown("`😂` 😂") == "`😂` ![😂](tg://emoji?id=1)"          # в коде не трогаем
+    assert em.html("<b>👍</b> 🤷") == '<b><tg-emoji emoji-id="3">👍</tg-emoji></b> 🤷'
+    assert em.single(" 💀 ") == "💀" and em.single("👍🏽") == "👍🏽" and em.single("❤️") == "❤️"
+    assert em.single("ок 👍") is None and em.single("2026") is None and em.single("") is None
+
+
+def test_web_fetch_guard():
+    """web_fetch не ходит на локальные и частные адреса (vLLM :8080, роутер) и не на не-http."""
+    from levbush.websearch import Web
+    web = Web(Config())
+
+    async def go():
+        return [await web.fetch(u) for u in ("http://127.0.0.1:8080/v1/models", "http://localhost:8888/",
+                                             "http://192.168.0.1/", "http://[::1]/", "file:///etc/passwd",
+                                             "http://10.8.0.1/")]
+
+    for out in asyncio.run(go()):
+        assert out.startswith("Не открылось"), out
+    html = "<html><head><title>Т</title></head><body><nav>меню</nav><article><p>" + "Важный текст. " * 30 + \
+           "</p></article></body></html>"
+    assert "Важный текст" in Web._text(html.encode(), "text/html", "utf-8")

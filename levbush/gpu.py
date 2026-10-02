@@ -2,17 +2,20 @@
 
 Два сервера, на GPU — только один за раз:
 - Nemotron 3 Nano Omni (`levbush-nemotron`) — описывает звук и видео (голосовые, кружки, видео, GIF);
-- Qwen 3.8 27B (`levbush-qwen`) — разбор (досье и связи) и пересказ; MTP + fp8 KV.
+- Qwen 3.8 27B (`levbush-qwen`) — разбор (досье и связи) и пересказ; MTP + KV TurboQuant.
 
 - Пока MiniMax H3 считает запрос (progress-файл), модель не запускается — ждём.
 - Перед запуском гасим второй свой сервер (дождавшись, пока он освободится).
 - Если VRAM не хватает и vLLM-Qwen пользователя (:8080 → :18081) бодрствует — усыпляем его, после работы будим.
+- Рабочий стол рисует та же RTX 5090 (1,5–3 ГиБ, и растёт, пока модель грузится), поэтому доля VRAM у Qwen — от
+  свободной памяти с запасом, а контекст vLLM подгоняет под оставшийся KV-кэш сам (--max-model-len -1).
 - Сервер — отдельный user-юнит (systemd-run) с потолком RAM. --enable-sleep-mode с Nemotron не работает (CUDA OOM
   при загрузке), поэтому по простою юнит просто останавливается.
 """
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -30,13 +33,31 @@ CUDA_HOME = os.environ.get("CUDA_HOME") or ("/opt/cuda" if Path("/opt/cuda/bin/n
 SERVED_NAME = "nemotron3-nano-omni"
 
 
-def gpu_free_gib() -> float:
+# vLLM (torch) видит «всего» без резерва драйвера: 31,40 ГиБ против 31,84 по nvidia-smi — и свободно тоже меньше
+DRIVER_RESERVED_GIB = 0.45
+
+
+def gpu_mem_gib() -> tuple[float, float]:
+    """(свободно, всего) по nvidia-smi, ГиБ; nan — нет nvidia-smi."""
     try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=10)
-        return int(out.stdout.split()[0]) / 1024
+        free, total = out.stdout.splitlines()[0].split(",")
+        return int(free) / 1024, int(total) / 1024
     except Exception:  # noqa: BLE001
-        return float("nan")
+        return float("nan"), float("nan")
+
+
+def gpu_free_gib() -> float:
+    return gpu_mem_gib()[0]
+
+
+def desktop_running() -> bool:
+    """Запущен Hyprland — рабочий стол рисует та же 5090, ему нужен запас VRAM побольше."""
+    try:
+        return subprocess.run(["pgrep", "-x", "Hyprland"], capture_output=True, timeout=5).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def h3_busy() -> str | None:
@@ -84,6 +105,8 @@ class LLMManager:
         self._lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
         self.model: str | None = None
+        self.max_len: int | None = None        # контекст запущенного сервера (у Qwen его подгоняет vLLM)
+        self.util = cfg.qwen_util
         self.state = "unknown"
         if kind == "qwen":
             self.unit, self.url, self.label = "levbush-qwen", cfg.qwen_url, "Qwen 3.8 27B"
@@ -112,7 +135,12 @@ class LLMManager:
         data = await served_models(self.url)
         if data:
             self.model = self.fixed_model or data[0]["id"]
+            self.max_len = data[0].get("max_model_len")
         return bool(data)
+
+    def ctx(self, cap: int) -> int:
+        """Контекст для запросов: сколько вместил сервер, но не больше cap."""
+        return min(self.max_len or cap, cap)
 
     def unit_active(self) -> bool:
         r = subprocess.run(["systemctl", "--user", "is-active", self.unit], capture_output=True, text=True)
@@ -154,12 +182,15 @@ class LLMManager:
                   "--structured-outputs-config", json.dumps({"backend": "xgrammar", "disable_any_whitespace": True})]
         if self.kind == "qwen":
             cmd = [vllm, "serve", cfg.qwen_model_path, "--served-model-name", cfg.qwen_name,
-                   "--max-model-len", str(cfg.qwen_ctx), "--max-num-seqs", str(cfg.qwen_seqs),
-                   "--gpu-memory-utilization", str(cfg.qwen_util),
+                   # -1: vLLM сам берёт наибольший контекст, который влезает в KV-кэш при доле self.util
+                   "--max-model-len", "-1", "--max-num-seqs", str(cfg.qwen_seqs),
+                   "--gpu-memory-utilization", f"{self.util:.3f}",
                    "--limit-mm-per-prompt", json.dumps({"image": cfg.qwen_images, "video": 0}),
                    "--mm-processor-kwargs", json.dumps({"max_pixels": 1048576}),
                    # без кэша префиксов: с ним MTP на запросах с картинками в vLLM 0.27.1 зависает (генерация 0 ток/с)
-                   "--no-enable-prefix-caching", "--reasoning-parser", "qwen3", *common]
+                   "--no-enable-prefix-caching", "--reasoning-parser", "qwen3",
+                   # инструменты — для обращений к боту (get_dossier); разбор и пересказ их не передают
+                   "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_xml", *common]
             cmd += ["--kv-cache-dtype", cfg.qwen_kv]
             if cfg.qwen_kv.startswith("turboquant"):
                 # групповому декод-ядру из патча нужно 64 куска KV (при 32 одному запросу мало программ на GPU)
@@ -196,6 +227,13 @@ class LLMManager:
                     await p.stop(wake_shared=False)
 
     async def _start(self):
+        if self.unit_active():
+            # юнит уже запускается (запуск из консоли, прошлый процесс бота): второй systemd-run упадёт с «already
+            # loaded», а проверка VRAM — на памяти, которую он занимает. Ждём его и считаем своим (гасится по простою)
+            log.info("%s уже запускается — жду его", self.label)
+            self.started_by_us = True
+            await self._wait_up()
+            return
         waited = 0
         while True:
             busy = h3_busy()
@@ -221,17 +259,33 @@ class LLMManager:
                 self.slept_qwen, p.slept_qwen = True, False
         if free == free and free < self.need_gib:
             raise RuntimeError(f"не хватает VRAM для {self.label}: свободно {free:.1f} из ~{self.need_gib:.0f} ГиБ")
+        desktop = desktop_running()
+        headroom = self.cfg.qwen_headroom_desktop_gib if desktop else self.cfg.qwen_headroom_gib
+        if self.kind == "qwen" and free == free:
+            # vLLM требует free ≥ util·total (в torch-единицах), а после прогрева держит ещё ~1,05–1,15 ГиБ сверх util
+            # (замер 30.09: доля 0,898 = 28,2 ГиБ, процесс — 29,3). С фиксированной 0,92 в тот день, когда рабочий
+            # стол переехал на 5090, запуск падал и на этой проверке, и в прогреве FlashInfer (CUDA OOM)
+            total = gpu_mem_gib()[1] - DRIVER_RESERVED_GIB
+            util = (free - DRIVER_RESERVED_GIB - headroom) / total
+            self.util = math.floor(min(self.cfg.qwen_util, util) * 1000) / 1000
         subprocess.run(["systemctl", "--user", "reset-failed", self.unit], capture_output=True)
         await self._say(f"🚀 Запускаю {self.label} (~2 мин)")
+        if self.kind == "qwen":
+            log.info("%s: свободно %.1f ГиБ VRAM, запас %.1f ГиБ%s, доля %.3f", self.label, free, headroom,
+                     " (Hyprland запущен)" if desktop else "", self.util)
         r = subprocess.run(self._command(), capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"systemd-run: {r.stderr.strip()[-500:]}")
         self.started_by_us = True
+        await self._wait_up()
+
+    async def _wait_up(self):
         deadline = time.monotonic() + 40 * 60          # первый старт собирает JIT-ядра до ~25 мин
         while time.monotonic() < deadline:
             if await self.is_up():
                 self.state = "up"
-                await self._say(f"✅ {self.label} запущен")
+                ctx = f", контекст {self.max_len // 1024}k" if self.kind == "qwen" and self.max_len else ""
+                await self._say(f"✅ {self.label} запущен{ctx}")
                 return
             if not self.unit_active():
                 logs = subprocess.run(["journalctl", "--user", "-u", self.unit, "-n", "30", "--no-pager"],

@@ -72,8 +72,11 @@ class LLM:
             return None
 
     async def chat(self, messages, schema: dict | None = None, *, max_tokens: int = 4096, temperature: float = 0.3,
-                   think: bool = False, think_budget: int = 0, audio_in_video: bool = False, retries: int = 2):
-        """think_budget — сколько токенов модель может рассуждать; max_tokens — на сам ответ (бюджет добавляется)."""
+                   think: bool = False, think_budget: int = 0, audio_in_video: bool = False, retries: int = 2,
+                   tools: list | None = None):
+        """think_budget — сколько токенов модель может рассуждать; max_tokens — на сам ответ (бюджет добавляется).
+        tools — инструменты (нужен --enable-auto-tool-choice у сервера); тогда ответ — сообщение целиком
+        (content, tool_calls), а не текст."""
         body = {"model": self.model, "messages": messages, "temperature": temperature,
                 "max_tokens": max_tokens + (think_budget if think else 0),
                 "chat_template_kwargs": {"enable_thinking": think},
@@ -85,6 +88,8 @@ class LLM:
             body["thinking_budget_tokens"] = think_budget      # llama.cpp (llama-server)
         if audio_in_video:
             body["mm_processor_kwargs"] = {"use_audio_in_video": True}
+        if tools:
+            body["tools"], body["tool_choice"] = tools, "auto"
         if schema is not None and self._schema_ok:
             body["response_format"] = {"type": "json_schema",
                                        "json_schema": {"name": "result", "schema": schema, "strict": True}}
@@ -101,6 +106,8 @@ class LLM:
                 if r.status_code >= 400:
                     raise LLMError(f"HTTP {r.status_code}: {_short_error(r.text)}")
                 choice = r.json()["choices"][0]
+                if tools:
+                    return choice["message"]
                 content = choice["message"].get("content") or ""
                 if choice.get("finish_reason") == "length" and schema is not None:
                     # почти всегда это зацикливание: повторяем холоднее, лимит не раздуваем
